@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Tethered Grid - Replay Visualizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom scrollbar for a sleeker look */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #111827; }
+        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+        
+        /* Range slider custom styling */
+        input[type=range] {
+            -webkit-appearance: none;
+            background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 16px;
+            width: 16px;
+            border-radius: 50%;
+            background: #3b82f6;
+            cursor: pointer;
+            margin-top: -6px;
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: #374151;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 h-screen flex flex-col font-sans overflow-hidden">
+
+    <!-- Top Navigation & File Upload -->
+    <header class="bg-gray-900 border-b border-gray-800 p-4 flex justify-between items-center shadow-md shrink-0">
+        <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded bg-blue-600 flex items-center justify-center font-bold text-white shadow-lg">TG</div>
+            <h1 class="text-xl font-bold tracking-wider text-gray-200 uppercase">The Tethered Grid</h1>
+        </div>
+        <div>
+            <label for="fileInput" class="cursor-pointer bg-gray-800 hover:bg-gray-700 text-sm px-4 py-2 rounded-lg border border-gray-700 transition-colors flex items-center gap-2 shadow-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                Load Replay JSON
+            </label>
+            <input type="file" id="fileInput" accept=".json" class="hidden">
+        </div>
+    </header>
+
+    <!-- Scoreboard -->
+    <div class="bg-gray-900/50 border-b border-gray-800 p-3 shrink-0 flex justify-center items-center gap-8 text-lg font-mono">
+        <div class="flex flex-col items-center">
+            <span class="text-xs text-gray-400 uppercase tracking-widest">Round</span>
+            <span id="roundDisplay" class="font-bold text-white text-xl">0 / 0</span>
+        </div>
+        <div class="h-8 w-px bg-gray-700"></div>
+        <div class="flex items-center gap-4 bg-blue-950/30 border border-blue-900/50 px-4 py-1 rounded-lg">
+            <div class="w-3 h-3 rounded-full bg-blue-500 shadow-[0_0_8px_#3b82f6]"></div>
+            <span class="text-blue-400 font-semibold uppercase tracking-wide text-sm">Player 1</span>
+            <span id="p1Score" class="font-bold text-2xl text-white ml-2">0</span>
+        </div>
+        <div class="flex items-center gap-4 bg-red-950/30 border border-red-900/50 px-4 py-1 rounded-lg">
+            <span id="p2Score" class="font-bold text-2xl text-white mr-2">0</span>
+            <span class="text-red-400 font-semibold uppercase tracking-wide text-sm">Player 2</span>
+            <div class="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_8px_#ef4444]"></div>
+        </div>
+    </div>
+
+    <!-- Main Canvas Area -->
+    <main class="flex-grow flex items-center justify-center p-4 min-h-0 overflow-hidden relative">
+        <div id="welcomeScreen" class="absolute inset-0 flex flex-col items-center justify-center z-10 bg-gray-950 pointer-events-none">
+            <svg class="w-16 h-16 text-gray-700 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"></path></svg>
+            <h2 class="text-2xl font-bold text-gray-500">Awaiting Replay Data</h2>
+            <p class="text-gray-600 mt-2">Load a match_final_replay.json file to begin.</p>
+        </div>
+        
+        <!-- Canvas wrapped in a container that maintains aspect ratio -->
+        <div class="h-full max-h-full aspect-square mx-auto relative shadow-2xl rounded-lg overflow-hidden border border-gray-800 bg-black shrink-0">
+            <!-- Using a high internal resolution (1000x1000) for sharp rendering, scaled by CSS -->
+            <canvas id="gameCanvas" width="1000" height="1000" class="w-full h-full block"></canvas>
+        </div>
+    </main>
+
+    <!-- Playback Controls -->
+    <footer class="bg-gray-900 border-t border-gray-800 p-4 shrink-0 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
+        <div class="max-w-5xl mx-auto flex flex-col gap-3">
+            
+            <!-- Timeline Slider -->
+            <div class="flex items-center gap-3">
+                <span class="text-xs text-gray-500 font-mono w-10 text-right">0</span>
+                <input type="range" id="frameSlider" min="0" max="0" value="0" class="flex-grow h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer" disabled>
+                <span id="maxFramesDisplay" class="text-xs text-gray-500 font-mono w-10">0</span>
+            </div>
+
+            <!-- Buttons & Speed -->
+            <div class="flex justify-between items-center mt-1">
+                <div class="w-1/3"></div> <!-- Spacer for centering -->
+                
+                <div class="flex items-center gap-2 justify-center w-1/3">
+                    <button id="btnStepBack" class="p-2 rounded-full hover:bg-gray-800 text-gray-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                        <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M19 20L9 12l10-8v16zM5 19h2V5H5v14z"></path></svg>
+                    </button>
+                    
+                    <button id="btnPlayPause" class="p-3 rounded-full bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-blue-900/50" disabled>
+                        <!-- Play Icon -->
+                        <svg id="iconPlay" class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"></path></svg>
+                        <!-- Pause Icon (Hidden initially) -->
+                        <svg id="iconPause" class="w-6 h-6 hidden" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"></path></svg>
+                    </button>
+                    
+                    <button id="btnStepForward" class="p-2 rounded-full hover:bg-gray-800 text-gray-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                        <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M5 4l10 8-10 8V4zm14 1v14h-2V5h2z"></path></svg>
+                    </button>
+                </div>
+                
+                <div class="w-1/3 flex justify-end">
+                    <div class="flex items-center bg-gray-800 rounded-lg border border-gray-700 px-2 py-1">
+                        <svg class="w-4 h-4 text-gray-400 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        <select id="speedSelect" class="bg-transparent text-sm text-gray-200 outline-none cursor-pointer">
+                            <option value="500">0.25x</option>
+                            <option value="200">0.5x</option>
+                            <option value="100" selected>1.0x (Normal)</option>
+                            <option value="50">2.0x</option>
+                            <option value="16">MAX (60fps)</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        // --- DOM Elements ---
+        const fileInput = document.getElementById('fileInput');
+        const welcomeScreen = document.getElementById('welcomeScreen');
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        // UI Displays
+        const roundDisplay = document.getElementById('roundDisplay');
+        const p1Score = document.getElementById('p1Score');
+        const p2Score = document.getElementById('p2Score');
+        
+        // Controls
+        const frameSlider = document.getElementById('frameSlider');
+        const maxFramesDisplay = document.getElementById('maxFramesDisplay');
+        const btnPlayPause = document.getElementById('btnPlayPause');
+        const btnStepBack = document.getElementById('btnStepBack');
+        const btnStepForward = document.getElementById('btnStepForward');
+        const speedSelect = document.getElementById('speedSelect');
+        const iconPlay = document.getElementById('iconPlay');
+        const iconPause = document.getElementById('iconPause');
+
+        // --- State Variables ---
+        let replayData = null;
+        let currentFrameIndex = 0;
+        let isPlaying = false;
+        let playTimer = null;
+        let gridSize = 100;
+        let cellSize = 10; // 1000px canvas / 100 grid size
+
+        // --- Colors ---
+        const COLORS = {
+            bg: "#000000",
+            wall: "#374151",      // Gray-700
+            p1: "#3b82f6",        // Blue-500
+            p2: "#ef4444",        // Red-500
+            storm: "rgba(168, 85, 247, 0.3)", // Purple-500 semi-transparent
+            terminal: "#06b6d4",  // Cyan-500
+            belt: "#9A3412",      // Orange-900 (Dark brown/orange)
+            beltArrow: "#fdba74"  // Orange-300
+        };
+
+        // --- Event Listeners ---
+
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                try {
+                    const parsedData = JSON.parse(evt.target.result);
+                    if (parsedData.frames && parsedData.frames.length > 0) {
+                        initReplay(parsedData);
+                    } else {
+                        alert("Invalid replay file structure.");
+                    }
+                } catch (err) {
+                    alert("Error parsing JSON file.");
+                    console.error(err);
+                }
+            };
+            reader.readAsText(file);
+        });
+
+        btnPlayPause.addEventListener('click', togglePlay);
+        
+        btnStepForward.addEventListener('click', () => {
+            pausePlayback();
+            setFrame(currentFrameIndex + 1);
+        });
+        
+        btnStepBack.addEventListener('click', () => {
+            pausePlayback();
+            setFrame(currentFrameIndex - 1);
+        });
+        
+        frameSlider.addEventListener('input', (e) => {
+            pausePlayback();
+            setFrame(parseInt(e.target.value, 10));
+        });
+
+        speedSelect.addEventListener('change', () => {
+            if (isPlaying) {
+                // Restart timer with new speed
+                pausePlayback();
+                startPlayback();
+            }
+        });
+
+        // --- Core Logic ---
+
+        function initReplay(data) {
+            replayData = data;
+            gridSize = data.grid_size || 100;
+            cellSize = canvas.width / gridSize;
+            currentFrameIndex = 0;
+            
+            // Setup UI
+            welcomeScreen.classList.add('hidden');
+            const totalFrames = replayData.frames.length - 1;
+            frameSlider.max = totalFrames;
+            frameSlider.disabled = false;
+            btnPlayPause.disabled = false;
+            btnStepBack.disabled = false;
+            btnStepForward.disabled = false;
+            maxFramesDisplay.innerText = totalFrames;
+
+            // Render first frame
+            setFrame(0);
+        }
+
+        function togglePlay() {
+            if (isPlaying) {
+                pausePlayback();
+            } else {
+                if (currentFrameIndex >= replayData.frames.length - 1) {
+                    setFrame(0); // Restart if at the end
+                }
+                startPlayback();
+            }
+        }
+
+        function startPlayback() {
+            if (!replayData) return;
+            isPlaying = true;
+            iconPlay.classList.add('hidden');
+            iconPause.classList.remove('hidden');
+            
+            const speedMs = parseInt(speedSelect.value, 10);
+            playTimer = setInterval(stepLoop, speedMs);
+        }
+
+        function pausePlayback() {
+            isPlaying = false;
+            iconPlay.classList.remove('hidden');
+            iconPause.classList.add('hidden');
+            if (playTimer) clearInterval(playTimer);
+        }
+
+        function stepLoop() {
+            if (currentFrameIndex < replayData.frames.length - 1) {
+                setFrame(currentFrameIndex + 1);
+            } else {
+                pausePlayback(); // Auto pause at end
+            }
+        }
+
+        function setFrame(index) {
+            if (!replayData) return;
+            
+            // Clamp index
+            index = Math.max(0, Math.min(index, replayData.frames.length - 1));
+            currentFrameIndex = index;
+            
+            const frame = replayData.frames[index];
+            
+            // Update UI components
+            frameSlider.value = index;
+            roundDisplay.innerText = `${frame.round} / ${replayData.frames.length - 1}`;
+            p1Score.innerText = frame.scores["1"] || 0;
+            p2Score.innerText = frame.scores["2"] || 0;
+
+            // Redraw canvas
+            renderCanvas(frame);
+        }
+
+        // --- Rendering Engine ---
+
+        function renderCanvas(frame) {
+            // 1. Clear Canvas
+            ctx.fillStyle = COLORS.bg;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // --- ISSUE 1 FIX: Mother-Node Glowing Effect ---
+            // Player 1 (Top 2 rows)
+            ctx.fillStyle = "rgba(59, 130, 246, 0.15)"; 
+            ctx.fillRect(0, 0, canvas.width, cellSize * 2);
+            // Player 2 (Bottom 2 rows)
+            ctx.fillStyle = "rgba(239, 68, 68, 0.15)"; 
+            ctx.fillRect(0, canvas.height - cellSize * 2, canvas.width, cellSize * 2);
+
+            // --- ISSUE 5 FIX: Draw Grid Lines ---
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for (let i = 0; i <= gridSize; i++) {
+                // Vertical lines
+                ctx.moveTo(i * cellSize, 0);
+                ctx.lineTo(i * cellSize, canvas.height);
+                // Horizontal lines
+                ctx.moveTo(0, i * cellSize);
+                ctx.lineTo(canvas.width, i * cellSize);
+            }
+            ctx.stroke();
+
+            // 2. Draw Static Walls (from root replay data)
+            if (replayData.walls) {
+                ctx.fillStyle = COLORS.wall;
+                for (const w of replayData.walls) {
+                    ctx.fillRect(w.x * cellSize, w.y * cellSize, cellSize, cellSize);
+                }
+            }
+
+            // 3. Draw Conveyor Belts
+            if (frame.belts) {
+                for (const b of frame.belts) {
+                    ctx.fillStyle = COLORS.belt;
+                    ctx.fillRect(b.x * cellSize, b.y * cellSize, cellSize, cellSize);
+                    
+                    // Direction Arrow
+                    ctx.beginPath();
+                    ctx.strokeStyle = COLORS.beltArrow;
+                    ctx.lineWidth = 2;
+                    let cx = b.x * cellSize + cellSize / 2;
+                    let cy = b.y * cellSize + cellSize / 2;
+                    ctx.moveTo(cx, cy);
+                    
+                    if (b.dir === "UP") cy -= cellSize / 3;
+                    else if (b.dir === "DOWN") cy += cellSize / 3;
+                    else if (b.dir === "LEFT") cx -= cellSize / 3;
+                    else if (b.dir === "RIGHT") cx += cellSize / 3;
+                    
+                    ctx.lineTo(cx, cy);
+                    ctx.stroke();
+                }
+            }
+
+            // 4. Draw Terminals
+            if (frame.terminals) {
+                ctx.fillStyle = COLORS.terminal;
+                ctx.shadowColor = COLORS.terminal;
+                ctx.shadowBlur = 10;
+                for (const t of frame.terminals) {
+                    ctx.fillRect(t.x * cellSize + 2, t.y * cellSize + 2, cellSize - 4, cellSize - 4);
+                }
+                ctx.shadowBlur = 0; // reset
+            }
+
+            // --- ISSUE 4 FIX: Draw Multiple Anima Storms ---
+            if (frame.storms) {
+                ctx.fillStyle = COLORS.storm;
+                for (const s of frame.storms) {
+                    // The storm is 3x3 centered on (s.x, s.y)
+                    ctx.fillRect((s.x - 1) * cellSize, (s.y - 1) * cellSize, cellSize * 3, cellSize * 3);
+                }
+            }
+
+            // 6. Draw Anchors (Squares)
+            if (frame.anchors) {
+                for (const a of frame.anchors) {
+                    ctx.fillStyle = a.p === 1 ? COLORS.p1 : COLORS.p2;
+                    ctx.fillRect(a.x * cellSize + 1, a.y * cellSize + 1, cellSize - 2, cellSize - 2);
+                    
+                    // Draw a directional beam indicator
+                    ctx.beginPath();
+                    ctx.strokeStyle = "#fff";
+                    ctx.lineWidth = 2;
+                    let cx = a.x * cellSize + cellSize / 2;
+                    let cy = a.y * cellSize + cellSize / 2;
+                    ctx.moveTo(cx, cy);
+                    
+                    if (a.dir === "UP") cy -= cellSize;
+                    else if (a.dir === "DOWN") cy += cellSize;
+                    else if (a.dir === "LEFT") cx -= cellSize;
+                    else if (a.dir === "RIGHT") cx += cellSize;
+                    
+                    ctx.lineTo(cx, cy);
+                    ctx.stroke();
+                }
+            }
+
+            // 7. Draw Drones (Circles)
+            if (frame.drones) {
+                for (const d of frame.drones) {
+                    const color = d.p === 1 ? COLORS.p1 : COLORS.p2;
+                    const cx = d.x * cellSize + cellSize / 2;
+                    const cy = d.y * cellSize + cellSize / 2;
+                    const radius = (cellSize / 2) - 1.5;
+
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+
+                    if (d.inert) {
+                        // Dead/Inert: Hollow Circle with an 'X'
+                        ctx.strokeStyle = color;
+                        ctx.lineWidth = 2;
+                        ctx.stroke();
+                        ctx.beginPath();
+                        ctx.moveTo(cx - radius/2, cy - radius/2);
+                        ctx.lineTo(cx + radius/2, cy + radius/2);
+                        ctx.moveTo(cx + radius/2, cy - radius/2);
+                        ctx.lineTo(cx - radius/2, cy + radius/2);
+                        ctx.strokeStyle = color;
+                        ctx.lineWidth = 1;
+                        ctx.stroke();
+                    } else if (!d.pow) {
+                        // Unpowered but alive: Semi-transparent
+                        ctx.globalAlpha = 0.4;
+                        ctx.fillStyle = color;
+                        ctx.fill();
+                        ctx.globalAlpha = 1.0;
+                        ctx.strokeStyle = color;
+                        ctx.lineWidth = 1;
+                        ctx.stroke();
+                    } else {
+                        // Fully powered and active
+                        ctx.fillStyle = color;
+                        ctx.fill();
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+</html>
