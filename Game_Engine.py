@@ -67,7 +67,7 @@ class GameState:
         self.round = 0
         self.current_player = 1
         
-        # Player 1 Mother-Node is y=0 and y=1. Player 2 is y=98 and y=99.
+        # Player 1 Mother-Node is row 0. Player 2 Mother-Node is row 49 (GRID_SIZE - 1).
         self.scores = {1: 0, 2: 0}
         
         # Entity Storage
@@ -75,14 +75,13 @@ class GameState:
         self.anchors: Dict[int, Anchor] = {}
         self.terminals: List[Terminal] = []
         
-        # 100x100 Grid matrices to store environmental data
+        # 50x50 Grid matrices to store environmental data
         # 0 = Empty, 1 = Normal Wall (#)
         self.walls_grid = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
         
         # Stores Direction enums for conveyor belts. NONE = no belt.
-        # ISSUE 5 FIX: Scaled down map features
         self.conveyor_grid = [[None for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-        self.storms = [AnimaStorm(x=random.randint(15, 35), y=random.randint(15, 35), multiplier=1) for _ in range(10)]
+        self.storms = self._place_storms()
 
         # Replay Data Storage
         self.replay_data = {
@@ -90,6 +89,57 @@ class GameState:
             "walls": [],
             "frames": []
         }
+
+    def _place_storms(self, count: int = 10) -> list:
+        """
+        Generates 'count' non-overlapping AnimaStorms spread across the grid interior.
+
+        Constraints (on 50x50 grid):
+          - Storm center y in [11, 38] so the 3x3 footprint (center ± 1) never
+            touches rows 0-9 (P1 Mother-Node area) or rows 40-49 (P2 Mother-Node area).
+          - Storm center x in [2, 47] so the 3x3 footprint stays inside the grid.
+          - Two storms are considered overlapping when BOTH |dx| < 3 AND |dy| < 3
+            (i.e. their 3x3 areas share at least one cell). Placement rejects these.
+          - The valid area is split into a 5-column × 2-row sub-grid (10 cells) so
+            one storm is seeded per region, preventing clustering at the centre.
+        """
+        storms = []
+        x_min, x_max = 2, 47   # keeps 3x3 footprint inside columns 1..48
+        y_min, y_max = 11, 38  # keeps 3x3 footprint inside rows 10..39
+
+        # ── Phase 1: one candidate per sub-region for even distribution ──────
+        cols_n, rows_n = 5, 2
+        x_step = (x_max - x_min + 1) // cols_n   # ≈9
+        y_step = (y_max - y_min + 1) // rows_n   # ≈14
+
+        candidates = []
+        for row in range(rows_n):
+            for col in range(cols_n):
+                rx_min = x_min + col * x_step
+                rx_max = min(x_max, rx_min + x_step - 1)
+                ry_min = y_min + row * y_step
+                ry_max = min(y_max, ry_min + y_step - 1)
+                candidates.append((random.randint(rx_min, rx_max),
+                                   random.randint(ry_min, ry_max)))
+
+        random.shuffle(candidates)
+        for cx, cy in candidates:
+            if len(storms) >= count:
+                break
+            if any(abs(cx - s.x) < 3 and abs(cy - s.y) < 3 for s in storms):
+                continue  # overlaps an existing storm
+            storms.append(AnimaStorm(x=cx, y=cy, multiplier=random.randint(1, 3)))
+
+        # ── Phase 2: rejection-sample any remaining slots ─────────────────────
+        attempts = 0
+        while len(storms) < count and attempts < 2000:
+            attempts += 1
+            cx = random.randint(x_min, x_max)
+            cy = random.randint(y_min, y_max)
+            if not any(abs(cx - s.x) < 3 and abs(cy - s.y) < 3 for s in storms):
+                storms.append(AnimaStorm(x=cx, y=cy, multiplier=random.randint(1, 3)))
+
+        return storms
 
     def get_entity_at(self, x: int, y: int):
         # Helper to check if a tile is occupied by a Drone or Anchor
@@ -205,7 +255,7 @@ class GameState:
                 drone.tick_battery() # Subtracts 1 from battery. If 0, becomes inert.
 
     def is_valid_cell(self, x: int, y: int) -> bool:
-        """Helper to check if coordinates are within the 100x100 grid."""
+        """Helper to check if coordinates are within the 50x50 grid."""
         return 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE
 
     def process_player_actions(self, player_id: int, commands: List[Dict]):
@@ -231,7 +281,7 @@ class GameState:
                 
                 # Check bounds, walls, and check if cell is occupied by ANY entity
                 if self.is_valid_cell(nx, ny) and self.walls_grid[ny][nx] == 0:
-                    # Mother-Node rows are impassable (y=0,1 and y=98,99)
+                    # Mother-Node rows are impassable (y=0 for P1, y=49 for P2)
                     if ny not in [0, GRID_SIZE - 1]: 
                         if self.get_entity_at(nx, ny) is None:
                             drone.x, drone.y = nx, ny
@@ -381,10 +431,10 @@ class GameState:
                 tx, ty = self.get_random_empty_cell(10, 40)
                 terminal.x, terminal.y = tx, ty
                 
-        if self.turn % 25 == 0:
-            for storm in self.storms:
-                storm.x = random.randint(15, 35)
-                storm.y = random.randint(15, 35)
+        # Every 25 full rounds, regenerate storms so they stay fresh and non-overlapping.
+        # Uses self.round (1-1500), not self.turn (0-2999), so the cadence is correct.
+        if self.round % 25 == 0:
+            self.storms = self._place_storms()
                 
         self.resolve_power_network()
         
@@ -409,6 +459,8 @@ class GameState:
         """Called at the end of every round to snapshot the board."""
         frame = {
             "round": self.round,
+            "turn": self.turn,
+            "active_player": self.current_player,
             "scores": {"1": self.scores[1], "2": self.scores[2]},
             "drones": [],
             "anchors": [],
@@ -647,10 +699,23 @@ def play_match(p1_cmd="", p2_cmd=""):
 
     # C. Spawn 25 Drones per player (P1 on row 1, P2 on row 48)
     drone_counter = 1
+    p1_occupied_x = set()
+    p2_occupied_x = set()
     for i in range(25):
-        game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=1, x=random.randint(0, GRID_SIZE - 1), y=1)
+        # Player 1: find an unoccupied X on row 1
+        x1 = random.randint(0, GRID_SIZE - 1)
+        while x1 in p1_occupied_x:
+            x1 = random.randint(0, GRID_SIZE - 1)
+        p1_occupied_x.add(x1)
+        game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=1, x=x1, y=1)
         drone_counter += 1
-        game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=2, x=random.randint(0, GRID_SIZE - 1), y=GRID_SIZE - 2)
+
+        # Player 2: find an unoccupied X on row 48
+        x2 = random.randint(0, GRID_SIZE - 1)
+        while x2 in p2_occupied_x:
+            x2 = random.randint(0, GRID_SIZE - 1)
+        p2_occupied_x.add(x2)
+        game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=2, x=x2, y=GRID_SIZE - 2)
         drone_counter += 1
 
     game.resolve_power_network()
@@ -658,6 +723,10 @@ def play_match(p1_cmd="", p2_cmd=""):
     # ---------------------------------------------------------
         
     game.initialize_replay()
+    # Record Frame 0: Initial spawn state before any turns are taken
+    game.round = 0
+    game.current_player = 1
+    game.record_frame()
     
     # ---------------------------------------------------------
     # 2. MATCH LOOP (TRUE TURN-BASED EXECUTION)
@@ -665,24 +734,18 @@ def play_match(p1_cmd="", p2_cmd=""):
     for turn in range(3000):
         game.turn = turn
         active_player = 1 if turn % 2 == 0 else 2
+        game.current_player = active_player
+        game.round = (turn // 2) + 1
         
         # 1. Ask ONLY the active player for moves
         payload = game.generate_player_payload(active_player)
-        try:
-            bot_processes[active_player].stdin.write(json.dumps(payload) + '\n')
-            bot_processes[active_player].stdin.flush()
-            
-            raw_response = bot_processes[active_player].stdout.readline().strip()
-            actions = json.loads(raw_response) if raw_response else []
-        except:
-            actions = []
+        actions = get_commands_from_bot(active_player, payload)
 
         # 2. Process ONLY the active player's actions
         game.process_player_actions(active_player, actions)
 
         # 3. Apply board mechanics after BOTH players have gone (every 1 full round = 2 turns)
         if turn % 2 == 1:
-            game.round += 1
             game.end_of_round_mechanics()
 
         # 4. Record the frame so the visualizer shows every single step back-and-forth
