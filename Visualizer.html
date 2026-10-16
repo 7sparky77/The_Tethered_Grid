@@ -3,482 +3,1139 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>The Tethered Grid - Replay Visualizer</title>
+    <title>The Tethered Grid - Python Engine Manual Tester</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Pyodide CPython WebAssembly Runtime -->
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js"></script>
     <style>
-        /* Custom scrollbar for a sleeker look */
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #111827; }
-        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
-        
-        /* Range slider custom styling */
-        input[type=range] {
-            -webkit-appearance: none;
-            background: transparent;
-        }
-        input[type=range]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            height: 16px;
-            width: 16px;
-            border-radius: 50%;
-            background: #3b82f6;
-            cursor: pointer;
-            margin-top: -6px;
-        }
-        input[type=range]::-webkit-slider-runnable-track {
-            width: 100%;
-            height: 4px;
-            cursor: pointer;
-            background: #374151;
-            border-radius: 2px;
+        canvas { cursor: crosshair; }
+        .mode-btn.active {
+            border-color: #3b82f6;
+            background: rgba(59, 130, 246, 0.25);
+            color: #93c5fd;
+            box-shadow: 0 0 10px rgba(59, 130, 246, 0.3);
         }
     </style>
 </head>
-<body class="bg-gray-950 text-gray-100 h-screen flex flex-col font-sans overflow-hidden">
+<body class="bg-gray-950 text-gray-100 h-screen flex flex-col font-sans overflow-hidden select-none">
 
-    <!-- Top Navigation & File Upload -->
-    <header class="bg-gray-900 border-b border-gray-800 p-4 flex justify-between items-center shadow-md shrink-0">
+    <!-- Header Navigation & Engine Status -->
+    <header class="bg-gray-900 border-b border-gray-800 px-4 py-2.5 flex justify-between items-center shadow-md shrink-0">
         <div class="flex items-center gap-3">
-            <div class="w-8 h-8 rounded bg-blue-600 flex items-center justify-center font-bold text-white shadow-lg">TG</div>
-            <h1 class="text-xl font-bold tracking-wider text-gray-200 uppercase">The Tethered Grid</h1>
+            <div class="w-8 h-8 rounded bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg text-sm">PY</div>
+            <div>
+                <h1 class="text-base font-bold tracking-wider text-gray-100 uppercase leading-none">Engine Manual Tester</h1>
+                <span class="text-[11px] text-gray-400 font-mono">Real-time Python Engine Execution</span>
+            </div>
         </div>
-        <div>
-            <label for="fileInput" class="cursor-pointer bg-gray-800 hover:bg-gray-700 text-sm px-4 py-2 rounded-lg border border-gray-700 transition-colors flex items-center gap-2 shadow-sm">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
-                Load Replay JSON
+
+        <!-- Engine Backend Status -->
+        <div class="flex items-center gap-3 bg-gray-950 px-3 py-1.5 rounded-lg border border-gray-800 text-xs font-mono">
+            <span class="text-gray-400">Backend:</span>
+            <span id="engineStatusBadge" class="flex items-center gap-1.5 font-bold text-amber-400">
+                <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse"></span>
+                <span>Initializing Pyodide Python...</span>
+            </span>
+            <span id="backendType" class="text-[10px] text-gray-500 font-sans hidden md:inline"></span>
+        </div>
+
+        <!-- Upload Engine .py Button -->
+        <div class="flex items-center gap-2">
+            <label for="pyFileInput" class="cursor-pointer bg-indigo-600 hover:bg-indigo-500 text-xs px-3 py-1.5 rounded-lg border border-indigo-500 font-semibold transition flex items-center gap-1.5 shadow-md text-white">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                <span>Upload Engine (.py)</span>
             </label>
-            <input type="file" id="fileInput" accept=".json" class="hidden">
+            <input type="file" id="pyFileInput" accept=".py" class="hidden">
+            
+            <button id="btnReloadEngine" class="bg-gray-800 hover:bg-gray-700 text-xs px-3 py-1.5 rounded-lg border border-gray-700 font-medium transition text-gray-300">
+                🔄 Restart Match
+            </button>
         </div>
     </header>
 
-    <!-- Scoreboard -->
-    <div class="bg-gray-900/50 border-b border-gray-800 p-3 shrink-0 flex justify-center items-center gap-8 text-lg font-mono">
-        <div class="flex flex-col items-center">
-            <span class="text-xs text-gray-400 uppercase tracking-widest">Round</span>
-            <span id="roundDisplay" class="font-bold text-white text-xl">0 / 0</span>
-            <span id="turnDisplay" class="text-[11px] text-gray-500 font-mono tracking-tight">Setup</span>
+    <!-- Scoreboard & Match Stats (Driven 100% by Python) -->
+    <div class="bg-gray-900 border-b border-gray-800 px-4 py-2 shrink-0 flex justify-between items-center text-sm font-mono">
+        <div class="flex items-center gap-4">
+            <div class="flex flex-col items-center justify-center bg-gray-950 px-3 py-1 rounded-lg border border-gray-800">
+                <span class="text-[10px] text-gray-400 uppercase tracking-widest">Engine Turn</span>
+                <span id="uiTurn" class="font-bold text-white text-sm">Turn 0</span>
+                <span id="uiRound" class="text-[10px] text-gray-400 font-mono">Round 0 / 1500</span>
+            </div>
+
+            <div id="activeBanner" class="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-blue-800 bg-blue-950/60 text-blue-300 text-xs font-bold">
+                <span id="activeDot" class="w-2.5 h-2.5 rounded-full bg-blue-500 shadow-[0_0_8px_#3b82f6]"></span>
+                <span id="activeText">Player 1's Turn</span>
+            </div>
         </div>
-        <div class="h-8 w-px bg-gray-700"></div>
-        <div id="p1Card" class="flex items-center gap-4 bg-blue-950/30 border border-blue-900/50 px-4 py-1 rounded-lg transition-all duration-150">
-            <div class="w-3 h-3 rounded-full bg-blue-500 shadow-[0_0_8px_#3b82f6]"></div>
-            <span class="text-blue-400 font-semibold uppercase tracking-wide text-sm">Player 1</span>
-            <span id="p1Score" class="font-bold text-2xl text-white ml-2">0</span>
+
+        <!-- Scores read directly from Python engine: game.scores -->
+        <div class="flex items-center gap-6">
+            <div id="p1ScoreCard" class="flex items-center gap-3 bg-blue-950/70 border-2 border-blue-400 px-4 py-1.5 rounded-xl shadow-[0_0_15px_rgba(59,130,246,0.3)]">
+                <div class="w-3 h-3 rounded-full bg-blue-500 shadow-[0_0_8px_#3b82f6]"></div>
+                <div class="flex flex-col">
+                    <span class="text-blue-400 font-bold text-xs uppercase">Player 1</span>
+                    <span class="text-[10px] text-gray-400">Alive: <strong id="p1Count" class="text-blue-300 font-bold">0</strong> | Spawned: <strong id="p1SpawnsUI" class="text-blue-300 font-bold">0</strong>/25</span>
+                </div>
+                <span id="p1Score" class="font-black text-2xl text-white ml-2">0</span>
+            </div>
+
+            <div class="text-gray-600 font-bold text-base">VS</div>
+
+            <div id="p2ScoreCard" class="flex items-center gap-3 bg-red-950/40 border border-red-900/60 px-4 py-1.5 rounded-xl">
+                <span id="p2Score" class="font-black text-2xl text-white mr-2">0</span>
+                <div class="flex flex-col text-right">
+                    <span class="text-red-400 font-bold text-xs uppercase">Player 2</span>
+                    <span class="text-[10px] text-gray-400">Alive: <strong id="p2Count" class="text-red-300 font-bold">0</strong> | Spawned: <strong id="p2SpawnsUI" class="text-red-300 font-bold">0</strong>/25</span>
+                </div>
+                <div class="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_8px_#ef4444]"></div>
+            </div>
         </div>
-        <div id="p2Card" class="flex items-center gap-4 bg-red-950/30 border border-red-900/50 px-4 py-1 rounded-lg transition-all duration-150">
-            <span id="p2Score" class="font-bold text-2xl text-white mr-2">0</span>
-            <span class="text-red-400 font-semibold uppercase tracking-wide text-sm">Player 2</span>
-            <div class="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_8px_#ef4444]"></div>
+
+        <div class="text-xs text-gray-400 font-mono hidden lg:flex items-center gap-4">
+            <div>Engine Drones: <span id="totalDronesCount" class="text-white font-bold">0</span></div>
+            <div>Walls: <span id="totalWallsCount" class="text-white font-bold">0</span></div>
+            <div>Storms: <span id="totalStormsCount" class="text-white font-bold">10</span></div>
         </div>
     </div>
 
-    <!-- Main Canvas Area -->
-    <main class="flex-grow flex items-center justify-center p-4 min-h-0 overflow-hidden relative">
-        <div id="welcomeScreen" class="absolute inset-0 flex flex-col items-center justify-center z-10 bg-gray-950 pointer-events-none">
-            <svg class="w-16 h-16 text-gray-700 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"></path></svg>
-            <h2 class="text-2xl font-bold text-gray-500">Awaiting Replay Data</h2>
-            <p class="text-gray-600 mt-2">Load a match_final_replay.json file to begin.</p>
-        </div>
-        
-        <!-- Canvas wrapped in a container that maintains aspect ratio -->
-        <div class="h-full max-h-full aspect-square mx-auto relative shadow-2xl rounded-lg overflow-hidden border border-gray-800 bg-black shrink-0">
-            <!-- Using a high internal resolution (1000x1000) for sharp rendering, scaled by CSS -->
-            <canvas id="gameCanvas" width="1000" height="1000" class="w-full h-full block"></canvas>
-        </div>
-    </main>
+    <!-- Main Workspace: 3 Columns -->
+    <main class="flex-grow flex p-3 gap-3 min-h-0 overflow-hidden">
 
-    <!-- Playback Controls -->
-    <footer class="bg-gray-900 border-t border-gray-800 p-4 shrink-0 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
-        <div class="max-w-5xl mx-auto flex flex-col gap-3">
+        <!-- Column 1: Manual Command Controls & Inspector (Left) -->
+        <aside class="w-80 flex flex-col gap-3 shrink-0 overflow-y-auto text-xs">
             
-            <!-- Timeline Slider -->
-            <div class="flex items-center gap-3">
-                <span class="text-xs text-gray-500 font-mono w-10 text-right">0</span>
-                <input type="range" id="frameSlider" min="0" max="0" value="0" class="flex-grow h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer" disabled>
-                <span id="maxFramesDisplay" class="text-xs text-gray-500 font-mono w-10">0</span>
-            </div>
-
-            <!-- Buttons & Speed -->
-            <div class="flex justify-between items-center mt-1">
-                <div class="w-1/3"></div> <!-- Spacer for centering -->
+            <!-- Turn Execution Call To Action -->
+            <div class="bg-gray-900 border border-indigo-900/60 rounded-xl p-3 flex flex-col gap-2 shadow-lg">
+                <span class="text-[10px] uppercase font-bold text-gray-400">Turn Resolution</span>
                 
-                <div class="flex items-center gap-2 justify-center w-1/3">
-                    <button id="btnStepBack" class="p-2 rounded-full hover:bg-gray-800 text-gray-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed" disabled>
-                        <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M19 20L9 12l10-8v16zM5 19h2V5H5v14z"></path></svg>
+                <!-- NEW: Undo / Redo Controls -->
+                <div class="flex gap-2 mb-1">
+                    <button id="btnUndo" disabled class="w-1/2 bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-1.5 rounded text-xs transition opacity-50 flex items-center justify-center gap-1 cursor-pointer disabled:cursor-not-allowed">
+                        <span>↩️ Undo</span>
                     </button>
-                    
-                    <button id="btnPlayPause" class="p-3 rounded-full bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-blue-900/50" disabled>
-                        <!-- Play Icon -->
-                        <svg id="iconPlay" class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"></path></svg>
-                        <!-- Pause Icon (Hidden initially) -->
-                        <svg id="iconPause" class="w-6 h-6 hidden" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"></path></svg>
-                    </button>
-                    
-                    <button id="btnStepForward" class="p-2 rounded-full hover:bg-gray-800 text-gray-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed" disabled>
-                        <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M5 4l10 8-10 8V4zm14 1v14h-2V5h2z"></path></svg>
+                    <button id="btnRedo" disabled class="w-1/2 bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold py-1.5 rounded text-xs transition opacity-50 flex items-center justify-center gap-1 cursor-pointer disabled:cursor-not-allowed">
+                        <span>Redo ↪️</span>
                     </button>
                 </div>
-                
-                <div class="w-1/3 flex justify-end">
-                    <div class="flex items-center bg-gray-800 rounded-lg border border-gray-700 px-2 py-1">
-                        <svg class="w-4 h-4 text-gray-400 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                        <select id="speedSelect" class="bg-transparent text-sm text-gray-200 outline-none cursor-pointer">
-                            <option value="500">0.25x</option>
-                            <option value="200">0.5x</option>
-                            <option value="100" selected>1.0x (Normal)</option>
-                            <option value="50">2.0x</option>
-                            <option value="16">MAX (60fps)</option>
-                        </select>
+
+                <button id="btnExecuteTurn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 px-3 rounded-lg text-xs transition shadow-[0_0_15px_rgba(99,102,241,0.4)] flex items-center justify-center gap-2">
+                    <span>⚡ Confirm & Advance Turn</span>
+                </button>
+                <p class="text-[10px] text-gray-400 leading-tight">
+                    Calls Python <code class="text-indigo-300">game.resolve_power_network()</code> & <code class="text-indigo-300">end_of_round_mechanics()</code>. Unpowered drones lose battery now.
+                </p>
+            </div>
+
+            <!-- Interaction Mode Selector -->
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-3 flex flex-col gap-2">
+                <div class="flex justify-between items-center">
+                    <span class="text-[10px] uppercase font-bold text-gray-400">Command Input Mode</span>
+                    <span id="turnLockIndicator" class="text-[10px] text-blue-400 font-bold">P1 Active</span>
+                </div>
+
+                <div class="grid grid-cols-2 gap-2">
+                    <button id="btnModeSpawn" class="mode-btn active p-2 rounded-lg border border-gray-700 text-left hover:bg-gray-800 transition">
+                        <span id="spawnModeLabel" class="block font-bold text-blue-400 text-xs">Spawn P1 Drone</span>
+                        <span class="text-[10px] text-gray-400">Click any square</span>
+                    </button>
+
+                    <button id="btnModeCommand" class="mode-btn p-2 rounded-lg border border-gray-700 text-left hover:bg-gray-800 transition">
+                        <span class="block font-bold text-emerald-400 text-xs">Command Drone</span>
+                        <span class="text-[10px] text-gray-400">Move / Push</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Drone Inspector (Read directly from Python Drone object) -->
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-3 flex flex-col gap-2">
+                <div class="flex justify-between items-center border-b border-gray-800 pb-1.5">
+                    <span class="text-[10px] uppercase font-bold text-gray-400">Python Drone Object</span>
+                    <span id="inspDroneId" class="font-mono font-bold text-gray-400">None Selected</span>
+                </div>
+
+                <div id="inspectorContent" class="flex flex-col gap-2 opacity-40 pointer-events-none transition-opacity">
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">Owner & Position:</span>
+                        <span id="inspPos" class="font-mono text-white font-bold">-</span>
+                    </div>
+
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">Python is_powered:</span>
+                        <span id="inspPoweredBadge" class="px-2 py-0.5 rounded text-[10px] font-bold bg-gray-800 text-gray-400">None</span>
+                    </div>
+
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">Python battery:</span>
+                        <div id="inspBatteryMeter" class="flex gap-1 items-center">
+                            <span class="w-3 h-3 rounded bg-gray-800"></span>
+                            <span class="w-3 h-3 rounded bg-gray-800"></span>
+                            <span class="w-3 h-3 rounded bg-gray-800"></span>
+                            <span id="inspBatteryVal" class="text-[10px] font-bold ml-1 text-gray-400">3/3</span>
+                        </div>
+                    </div>
+
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">Python is_inert:</span>
+                        <span id="inspInertBadge" class="font-mono font-bold text-gray-400">False</span>
+                    </div>
+
+                    <!-- Direct Directional Controls -->
+                    <div class="mt-2 flex flex-col gap-1.5">
+                        <span class="text-[10px] text-gray-400 font-semibold uppercase">Dispatch Command to Engine:</span>
+                        <div class="grid grid-cols-3 gap-1 text-center font-bold">
+                            <div></div>
+                            <button id="btnCmdUp" class="bg-gray-800 hover:bg-gray-700 text-white p-1.5 rounded border border-gray-700 transition">⬆️ UP</button>
+                            <div></div>
+                            <button id="btnCmdLeft" class="bg-gray-800 hover:bg-gray-700 text-white p-1.5 rounded border border-gray-700 transition">⬅️ LEFT</button>
+                            <button id="btnCmdWait" class="bg-gray-800 hover:bg-gray-700 text-gray-300 p-1.5 rounded text-[10px] border border-gray-700 transition">WAIT</button>
+                            <button id="btnCmdRight" class="bg-gray-800 hover:bg-gray-700 text-white p-1.5 rounded border border-gray-700 transition">➡️ RIGHT</button>
+                            <div></div>
+                            <button id="btnCmdDown" class="bg-gray-800 hover:bg-gray-700 text-white p-1.5 rounded border border-gray-700 transition">⬇️ DOWN</button>
+                            <div></div>
+                        </div>
+
+                        <button id="btnCmdPush" class="w-full bg-amber-950/60 hover:bg-amber-900/60 border border-amber-800/80 text-amber-300 font-bold p-1 rounded transition text-xs">
+                            💥 PUSH Adjacent Entity
+                        </button>
                     </div>
                 </div>
             </div>
+
+            <!-- Real-time Python Console Log -->
+            <div class="bg-gray-950 border border-gray-800 rounded-xl p-3 flex flex-col gap-1.5 flex-grow min-h-[140px]">
+                <div class="flex justify-between items-center text-[10px] uppercase font-bold text-gray-400 border-b border-gray-800 pb-1">
+                    <span>Engine Output Log</span>
+                    <button id="btnClearLog" class="text-gray-500 hover:text-gray-300 text-[9px]">Clear</button>
+                </div>
+                <div id="engineLog" class="flex-grow font-mono text-[10px] text-gray-400 overflow-y-auto space-y-1 h-32 select-text">
+                    <div class="text-gray-600">// Engine log will appear here...</div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Column 2: Pure Canvas Grid (Center) -->
+        <div class="flex-grow flex flex-col items-center justify-center bg-black border border-gray-800 rounded-xl relative overflow-hidden">
+            <!-- Canvas Container -->
+            <div class="h-full max-h-full aspect-square relative shadow-2xl overflow-hidden shrink-0">
+                <canvas id="gameCanvas" width="1000" height="1000" class="w-full h-full block"></canvas>
+            </div>
+
+            <!-- Toast Notification -->
+            <div id="toast" class="absolute bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-900/95 border border-gray-700 text-white px-4 py-2 rounded-lg shadow-xl text-xs font-mono transition-opacity opacity-0 pointer-events-none z-20">
+                Notification
+            </div>
         </div>
-    </footer>
+
+        <!-- Column 3: Fog of War Payload & Engine Inspector (Right) -->
+        <aside class="w-80 flex flex-col gap-3 shrink-0 overflow-y-auto text-xs">
+            
+            <!-- Live Fog of War Payload View -->
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-3 flex flex-col gap-2 flex-grow">
+                <div class="flex justify-between items-center border-b border-gray-800 pb-1.5">
+                    <span class="text-[10px] uppercase font-bold text-gray-400">Bot Fog of War Payload</span>
+                    <span id="payloadPlayerBadge" class="text-[10px] font-mono font-bold text-blue-400">P1 Vision (5x5)</span>
+                </div>
+                <p class="text-[10px] text-gray-400 leading-tight">
+                    Output of <code class="text-indigo-300">game.generate_player_payload(active_player)</code> sent to bot:
+                </p>
+                <div class="bg-gray-950 border border-gray-800 rounded-lg p-2 font-mono text-[10px] text-gray-300 overflow-auto flex-grow h-64 select-text">
+                    <pre id="payloadJson" class="whitespace-pre-wrap">{ "awaiting": "engine execution" }</pre>
+                </div>
+            </div>
+
+            <!-- Mechanics Checklist -->
+            <div class="bg-gray-900/40 border border-gray-800 rounded-xl p-3 text-[10px] text-gray-400 leading-relaxed font-sans">
+                <span class="font-bold text-gray-200">How to test robustness:</span><br>
+                1. <strong>Spawn</strong> up to 25 drones anywhere on the grid.<br>
+                2. <strong>Move</strong> an unpowered drone $\rightarrow$ Observe battery stays intact during planning, and drops by 1 upon clicking <strong>Confirm & Advance</strong>.<br>
+                3. <strong>Push</strong> a drone into a wall row $\rightarrow$ Verify Python engine crushes and permanently deletes it.<br>
+                4. <strong>Storm Multiplier</strong> $\rightarrow$ Park powered drone in storm, verify score increases directly in <code class="text-gray-300">game.scores</code>.
+            </div>
+        </aside>
+
+    </main>
 
     <script>
-        // --- DOM Elements ---
-        const fileInput = document.getElementById('fileInput');
-        const welcomeScreen = document.getElementById('welcomeScreen');
+        // ==========================================
+        // --- CONSTANTS & CANVAS SETUP ---
+        // ==========================================
+        const GRID_SIZE = 50;
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
-        
-        // UI Displays
-        const roundDisplay = document.getElementById('roundDisplay');
-        const turnDisplay = document.getElementById('turnDisplay');
-        const p1Score = document.getElementById('p1Score');
-        const p2Score = document.getElementById('p2Score');
-        const p1Card = document.getElementById('p1Card');
-        const p2Card = document.getElementById('p2Card');
-        
-        // Controls
-        const frameSlider = document.getElementById('frameSlider');
-        const maxFramesDisplay = document.getElementById('maxFramesDisplay');
-        const btnPlayPause = document.getElementById('btnPlayPause');
-        const btnStepBack = document.getElementById('btnStepBack');
-        const btnStepForward = document.getElementById('btnStepForward');
-        const speedSelect = document.getElementById('speedSelect');
-        const iconPlay = document.getElementById('iconPlay');
-        const iconPause = document.getElementById('iconPause');
 
-        // --- State Variables ---
-        let replayData = null;
-        let currentFrameIndex = 0;
-        let isPlaying = false;
-        let playTimer = null;
-        let gridSize = 100;
-        let cellSize = 10; // 1000px canvas / 100 grid size
-
-        // --- Colors ---
         const COLORS = {
             bg: "#000000",
-            wall: "#374151",      // Gray-700
-            p1: "#3b82f6",        // Blue-500
-            p2: "#ef4444",        // Red-500
-            storm: "rgba(168, 85, 247, 0.3)", // Purple-500 semi-transparent
-            terminal: "#06b6d4",  // Cyan-500
-            belt: "#9A3412",      // Orange-900 (Dark brown/orange)
-            beltArrow: "#fdba74"  // Orange-300
+            wall: "#374151",
+            p1: "#3b82f6",
+            p2: "#ef4444",
+            storm: "rgba(168, 85, 247, 0.35)",
+            stormBorder: "rgba(168, 85, 247, 0.7)"
         };
 
-        // --- Event Listeners ---
+        // ==========================================
+        // --- APPLICATION STATE ---
+        // ==========================================
+        let pyodide = null;
+        let isEngineReady = false;
+        let activePlayer = 1;
+        let currentMode = 'SPAWN'; 
+        let selectedDroneId = null;
+        let actedDronesThisTurn = new Set(); 
+        
+        // NEW: History Stacks & Spawn Limits
+        let undoStack = [];
+        let redoStack = [];
+        let p1Spawns = 0;
+        let p2Spawns = 0;
 
-        fileInput.addEventListener('change', (e) => {
+        // Mirror of Engine State retrieved from Python
+        let engineState = {
+            turn: 0,
+            round: 0,
+            scores: { "1": 0, "2": 0 },
+            walls: Array(GRID_SIZE).fill().map(() => Array(GRID_SIZE).fill(0)),
+            storms: [],
+            terminals: [],
+            drones: []
+        };
+
+        // ==========================================
+        // --- DOM REFERENCES ---
+        // ==========================================
+        const engineStatusBadge = document.getElementById('engineStatusBadge');
+        const backendType = document.getElementById('backendType');
+        const pyFileInput = document.getElementById('pyFileInput');
+        const btnReloadEngine = document.getElementById('btnReloadEngine');
+
+        const uiTurn = document.getElementById('uiTurn');
+        const uiRound = document.getElementById('uiRound');
+        const activeBanner = document.getElementById('activeBanner');
+        const activeDot = document.getElementById('activeDot');
+        const activeText = document.getElementById('activeText');
+        const p1ScoreEl = document.getElementById('p1Score');
+        const p2ScoreEl = document.getElementById('p2Score');
+        const p1CountEl = document.getElementById('p1Count');
+        const p2CountEl = document.getElementById('p2Count');
+        const p1ScoreCard = document.getElementById('p1ScoreCard');
+        const p2ScoreCard = document.getElementById('p2ScoreCard');
+        const totalDronesCount = document.getElementById('totalDronesCount');
+        const totalWallsCount = document.getElementById('totalWallsCount');
+        const totalStormsCount = document.getElementById('totalStormsCount');
+
+        const btnExecuteTurn = document.getElementById('btnExecuteTurn');
+        const btnModeSpawn = document.getElementById('btnModeSpawn');
+        const btnModeCommand = document.getElementById('btnModeCommand');
+        const spawnModeLabel = document.getElementById('spawnModeLabel');
+        const turnLockIndicator = document.getElementById('turnLockIndicator');
+
+        const inspectorContent = document.getElementById('inspectorContent');
+        const inspDroneId = document.getElementById('inspDroneId');
+        const inspPos = document.getElementById('inspPos');
+        const inspPoweredBadge = document.getElementById('inspPoweredBadge');
+        const inspBatteryMeter = document.getElementById('inspBatteryMeter');
+        const inspBatteryVal = document.getElementById('inspBatteryVal');
+        const inspInertBadge = document.getElementById('inspInertBadge');
+
+        const btnCmdUp = document.getElementById('btnCmdUp');
+        const btnCmdDown = document.getElementById('btnCmdDown');
+        const btnCmdLeft = document.getElementById('btnCmdLeft');
+        const btnCmdRight = document.getElementById('btnCmdRight');
+        const btnCmdWait = document.getElementById('btnCmdWait');
+        const btnCmdPush = document.getElementById('btnCmdPush');
+
+        const engineLog = document.getElementById('engineLog');
+        const btnClearLog = document.getElementById('btnClearLog');
+        const payloadJson = document.getElementById('payloadJson');
+        const payloadPlayerBadge = document.getElementById('payloadPlayerBadge');
+        const toastEl = document.getElementById('toast');
+
+        const p1SpawnsUI = document.getElementById('p1SpawnsUI'); // NEW
+        const p2SpawnsUI = document.getElementById('p2SpawnsUI'); // NEW
+
+        // ==========================================
+        // --- UNDO / REDO STATE MANAGEMENT ---
+        // ==========================================
+
+        const btnUndo = document.getElementById('btnUndo');
+        const btnRedo = document.getElementById('btnRedo');
+
+        function updateUndoRedoUI() {
+            btnUndo.disabled = undoStack.length === 0;
+            btnUndo.style.opacity = undoStack.length === 0 ? "0.5" : "1";
+            btnRedo.disabled = redoStack.length === 0;
+            btnRedo.style.opacity = redoStack.length === 0 ? "0.5" : "1";
+        }
+
+        async function pushState() {
+            if (!isEngineReady) return;
+            try {
+                // FIX: Keep the deep copies directly inside Python memory for speed and stability
+                await pyodide.runPythonAsync(`
+import copy
+if 'history_stack' not in globals():
+    history_stack = []
+    redo_stack = []
+history_stack.append(copy.deepcopy(game))
+if len(history_stack) > 50:
+    history_stack.pop(0)
+redo_stack.clear()
+`);
+                undoStack.push({
+                    activePlayer: activePlayer,
+                    actedDrones: Array.from(actedDronesThisTurn),
+                    p1Spawns: p1Spawns, // NEW
+                    p2Spawns: p2Spawns  // NEW
+                });
+                if (undoStack.length > 50) undoStack.shift();
+                redoStack = [];
+                updateUndoRedoUI();
+            } catch (err) { console.error("State save error:", err); }
+        }
+
+        btnUndo.addEventListener('click', async () => {
+            if (undoStack.length === 0) return;
+            try {
+                // FIX: Retrieve state natively in Python
+                await pyodide.runPythonAsync(`
+redo_stack.append(copy.deepcopy(game))
+game = history_stack.pop()
+`);
+                redoStack.push({
+                    activePlayer: activePlayer,
+                    actedDrones: Array.from(actedDronesThisTurn),
+                    p1Spawns: p1Spawns, // NEW
+                    p2Spawns: p2Spawns  // NEW
+                });
+                
+                const prevState = undoStack.pop();
+                activePlayer = prevState.activePlayer;
+                actedDronesThisTurn = new Set(prevState.actedDrones);
+                p1Spawns = prevState.p1Spawns; // NEW
+                p2Spawns = prevState.p2Spawns; // NEW
+                selectedDroneId = null;
+                
+                await syncFromEngine();
+                updateUndoRedoUI();
+                logToConsole("↩️ Action Undone", "system");
+            } catch (err) { console.error("Undo error:", err); }
+        });
+
+        btnRedo.addEventListener('click', async () => {
+            if (redoStack.length === 0) return;
+            try {
+                // FIX: Retrieve state natively in Python
+                await pyodide.runPythonAsync(`
+history_stack.append(copy.deepcopy(game))
+game = redo_stack.pop()
+`);
+                undoStack.push({
+                    activePlayer: activePlayer,
+                    actedDrones: Array.from(actedDronesThisTurn),
+                    p1Spawns: p1Spawns, // NEW
+                    p2Spawns: p2Spawns  // NEW
+                });
+                
+                const nextState = redoStack.pop();
+                activePlayer = nextState.activePlayer;
+                actedDronesThisTurn = new Set(nextState.actedDrones);
+                p1Spawns = prevState.p1Spawns; // NEW
+                p2Spawns = prevState.p2Spawns; // NEW
+                selectedDroneId = null;
+                
+                await syncFromEngine();
+                updateUndoRedoUI();
+                logToConsole("↪️ Action Redone", "system");
+            } catch (err) { console.error("Redo error:", err); }
+        });
+
+        // ==========================================
+        // --- PYODIDE INITIALIZATION & CODE LOADING ---
+        // ==========================================
+
+        async function initEngine() {
+            logToConsole("Initializing Pyodide CPython WebAssembly sandbox...", "system");
+            try {
+                pyodide = await loadPyodide();
+                logToConsole("Pyodide loaded successfully! Awaiting engine file upload or auto-load.", "system");
+
+                // Try to auto-load Game_Engine - Copy.py if running via local server
+                try {
+                    const response = await fetch('Game_Engine - Copy.py');
+                    if (response.ok) {
+                        const code = await response.text();
+                        await loadPythonEngineCode(code, "Game_Engine - Copy.py");
+                        return;
+                    }
+                } catch (e) {
+                    // Running directly as a file without web server, ask user to select file
+                }
+
+                engineStatusBadge.className = "flex items-center gap-1.5 font-bold text-blue-400";
+                engineStatusBadge.innerHTML = `<span class="w-2.5 h-2.5 rounded-full bg-blue-400"></span><span>Ready: Upload 'Game_Engine - Copy.py'</span>`;
+                backendType.innerText = "Pyodide WASM Ready";
+                showToast("Please upload your 'Game_Engine - Copy.py' file to start!");
+            } catch (err) {
+                logToConsole(`Failed to load Pyodide: ${err.message}`, "error");
+                engineStatusBadge.className = "flex items-center gap-1.5 font-bold text-red-500";
+                engineStatusBadge.innerHTML = `<span>Error Loading Pyodide</span>`;
+            }
+        }
+
+        pyFileInput.addEventListener('change', (e) => {
             const file = e.target.files[0];
             if (!file) return;
 
             const reader = new FileReader();
-            reader.onload = (evt) => {
-                try {
-                    const parsedData = JSON.parse(evt.target.result);
-                    if (parsedData.frames && parsedData.frames.length > 0) {
-                        initReplay(parsedData);
-                    } else {
-                        alert("Invalid replay file structure.");
-                    }
-                } catch (err) {
-                    alert("Error parsing JSON file.");
-                    console.error(err);
-                }
+            reader.onload = async (evt) => {
+                const code = evt.target.result;
+                await loadPythonEngineCode(code, file.name);
             };
             reader.readAsText(file);
         });
 
-        btnPlayPause.addEventListener('click', togglePlay);
-        
-        btnStepForward.addEventListener('click', () => {
-            pausePlayback();
-            setFrame(currentFrameIndex + 1);
-        });
-        
-        btnStepBack.addEventListener('click', () => {
-            pausePlayback();
-            setFrame(currentFrameIndex - 1);
-        });
-        
-        frameSlider.addEventListener('input', (e) => {
-            pausePlayback();
-            setFrame(parseInt(e.target.value, 10));
-        });
+        async function loadPythonEngineCode(pyCode, filename) {
+            logToConsole(`Compiling and executing '${filename}' in Python sandbox...`, "system");
+            try {
+                // Set up module execution environment so:
+                // 1) __file__ is defined
+                // 2) __name__ is NOT "__main__" so it imports classes and functions without launching background bots/play_match()
+                await pyodide.runPythonAsync(`
+import sys, os
+__file__ = "${filename.replace(/\\/g, '\\\\')}"
+sys.argv = [__file__]
+import builtins
+`);
 
-        speedSelect.addEventListener('change', () => {
-            if (isPlaying) {
-                // Restart timer with new speed
-                pausePlayback();
-                startPlayback();
-            }
-        });
+                // Run engine with __name__ set to module name
+                const escapedPyCode = JSON.stringify(pyCode);
+                await pyodide.runPythonAsync(`
+code_str = ${escapedPyCode}
+engine_globals = {"__name__": "game_engine", "__file__": __file__, "__builtins__": __builtins__}
+exec(code_str, engine_globals)
+# Bring all engine classes/functions into pyodide global scope for direct access
+globals().update(engine_globals)
+`);
 
-        // --- Core Logic ---
+                // Instantiate GameState and set up match environment
+                await pyodide.runPythonAsync(`
+import random, json
 
-        function initReplay(data) {
-            replayData = data;
-            gridSize = data.grid_size || 100;
-            cellSize = canvas.width / gridSize;
-            currentFrameIndex = 0;
-            
-            // Setup UI
-            welcomeScreen.classList.add('hidden');
-            const totalFrames = replayData.frames.length - 1;
-            frameSlider.max = totalFrames;
-            frameSlider.disabled = false;
-            btnPlayPause.disabled = false;
-            btnStepBack.disabled = false;
-            btnStepForward.disabled = false;
-            maxFramesDisplay.innerText = totalFrames;
+game = GameState()
+game.walls_grid = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
 
-            // Render first frame
-            setFrame(0);
-        }
+# Symmetrical Walls
+walls_placed = 0
+while walls_placed < 20: 
+    wx = random.randint(0, GRID_SIZE - 1)
+    wy = random.randint(2, (GRID_SIZE // 2) - 1)
+    if 15 <= wx <= 35 and 15 <= wy <= 35:
+        continue
+    game.walls_grid[wy][wx] = 1
+    game.walls_grid[GRID_SIZE - 1 - wy][GRID_SIZE - 1 - wx] = 1
+    walls_placed += 1
 
-        function togglePlay() {
-            if (isPlaying) {
-                pausePlayback();
-            } else {
-                if (currentFrameIndex >= replayData.frames.length - 1) {
-                    setFrame(0); // Restart if at the end
-                }
-                startPlayback();
-            }
-        }
+# Terminals
+for i in range(10): 
+    tx, ty = game.get_random_empty_cell(10, 40)
+    game.terminals.append(Terminal(terminal_id=i, x=tx, y=ty))
 
-        function startPlayback() {
-            if (!replayData) return;
-            isPlaying = true;
-            iconPlay.classList.add('hidden');
-            iconPause.classList.remove('hidden');
-            
-            const speedMs = parseInt(speedSelect.value, 10);
-            playTimer = setInterval(stepLoop, speedMs);
-        }
+next_drone_id = 1
+`);
+                isEngineReady = true;
+                logToConsole(`SUCCESS: ${filename} is active! GameState created.`, "success");
 
-        function pausePlayback() {
-            isPlaying = false;
-            iconPlay.classList.remove('hidden');
-            iconPause.classList.add('hidden');
-            if (playTimer) clearInterval(playTimer);
-        }
+                engineStatusBadge.className = "flex items-center gap-1.5 font-bold text-emerald-400";
+                engineStatusBadge.innerHTML = `<span class="w-2.5 h-2.5 rounded-full bg-emerald-400"></span><span>Python Engine Active: ${filename}</span>`;
+                backendType.innerText = "CPython 3.12 (WASM)";
 
-        function stepLoop() {
-            if (currentFrameIndex < replayData.frames.length - 1) {
-                setFrame(currentFrameIndex + 1);
-            } else {
-                pausePlayback(); // Auto pause at end
+                await syncFromEngine();
+                showToast(`Loaded ${filename}! Ready for manual commands.`);
+            } catch (err) {
+                logToConsole(`Python Error during engine setup:\n${err.message}`, "error");
+                showToast("Error executing Python engine. Check log.");
             }
         }
 
-        function setFrame(index) {
-            if (!replayData) return;
+        btnReloadEngine.addEventListener('click', async () => {
+            if (!isEngineReady) return showToast("No engine loaded yet!");
             
-            // Clamp index
-            index = Math.max(0, Math.min(index, replayData.frames.length - 1));
-            currentFrameIndex = index;
+            undoStack = [];
+            redoStack = [];
+            updateUndoRedoUI();
+            actedDronesThisTurn.clear();
+            p1Spawns = 0; // NEW
+            p2Spawns = 0; // NEW
             
-            const frame = replayData.frames[index];
+            await pyodide.runPythonAsync(`
+game = GameState()
+game.walls_grid = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+walls_placed = 0
+while walls_placed < 20: 
+    wx = random.randint(0, GRID_SIZE - 1)
+    wy = random.randint(2, (GRID_SIZE // 2) - 1)
+    if 15 <= wx <= 35 and 15 <= wy <= 35: continue
+    game.walls_grid[wy][wx] = 1
+    game.walls_grid[GRID_SIZE - 1 - wy][GRID_SIZE - 1 - wx] = 1
+    walls_placed += 1
+
+for i in range(10): 
+    tx, ty = game.get_random_empty_cell(10, 40)
+    game.terminals.append(Terminal(terminal_id=i, x=tx, y=ty))
+
+next_drone_id = 1
+`);
+            selectedDroneId = null;
+            activePlayer = 1;
+            await syncFromEngine();
+            showToast("Engine match reset!");
+        });
+
+        // ==========================================
+        // --- SYNCHRONIZATION WITH PYTHON ENGINE ---
+        // ==========================================
+
+        async function syncFromEngine() {
+            if (!isEngineReady) return;
+            try {
+                const pyOutJson = await pyodide.runPythonAsync(`
+import json
+
+drones_list = []
+for d in game.drones.values():
+    drones_list.append({
+        "id": d.drone_id,
+        "player_id": d.player_id,
+        "x": d.x,
+        "y": d.y,
+        "battery": d.battery,
+        "is_powered": d.is_powered,
+        "is_inert": d.is_inert
+    })
+
+storms_list = [{"x": s.x, "y": s.y, "multiplier": s.multiplier} for s in game.storms]
+terminals_list = [{"x": t.x, "y": t.y} for t in game.terminals]
+
+payload = game.generate_player_payload(${activePlayer})
+
+json.dumps({
+    "turn": game.turn,
+    "round": game.round,
+    "scores": game.scores,
+    "walls": game.walls_grid,
+    "storms": storms_list,
+    "terminals": terminals_list,
+    "drones": drones_list,
+    "payload": payload
+})
+`);
+                const parsed = JSON.parse(pyOutJson);
+                engineState = parsed;
+
+                updateUI();
+                renderCanvas();
+            } catch (err) {
+                logToConsole(`Error reading state from Python: ${err.message}`, "error");
+            }
+        }
+
+        // ==========================================
+        // --- SEND COMMANDS TO PYTHON ENGINE ---
+        // ==========================================
+
+        async function dispatchCommandToEngine(droneId, action, dirStr = "NONE") {
+            if (!isEngineReady) return showToast("Python engine is not loaded!");
+            if (actedDronesThisTurn.has(droneId)) return showToast(`Drone #${droneId} has already acted this turn!`);
+
+            await pushState(); // SAVE STATE HERE
+
+            logToConsole(`>> [Player ${activePlayer}] Command: drone_id=${droneId}, action=${action}, dir=${dirStr}`);
+
+            try {
+                await pyodide.runPythonAsync(`
+commands = [{
+    "drone_id": ${droneId},
+    "action": "${action}",
+    "direction": "${dirStr}"
+}]
+game.process_player_actions(${activePlayer}, commands)
+`);             
+                // Lock drone and auto-deselect after it takes an action
+                actedDronesThisTurn.add(droneId);
+                selectedDroneId = null;
+                await syncFromEngine();
+            } catch (err) {
+                logToConsole(`Python Exception in process_player_actions:\n${err.message}`, "error");
+            }
+        }
+
+        async function spawnDroneInEngine(x, y) {
+            if (!isEngineReady) return showToast("Python engine is not loaded!");
+
+            // FIX: Check lifetime spawns instead of current board count
+            if (activePlayer === 1 && p1Spawns >= 25) {
+                return showToast("Player 1 has exhausted all 25 lifetime spawns!");
+            }
+            if (activePlayer === 2 && p2Spawns >= 25) {
+                return showToast("Player 2 has exhausted all 25 lifetime spawns!");
+            }
+
+            await pushState(); // SAVE STATE HERE
             
-            // Update UI components
-            frameSlider.value = index;
-            const lastFrame = replayData.frames[replayData.frames.length - 1];
-            const totalRounds = (lastFrame && lastFrame.round > 0) ? lastFrame.round : Math.max(1, Math.floor((replayData.frames.length - 1) / 2));
-            roundDisplay.innerText = `${frame.round} / ${totalRounds}`;
+            // Increment the lifetime tracker
+            if (activePlayer === 1) p1Spawns++;
+            else p2Spawns++;
+
+            logToConsole(`>> [Player ${activePlayer}] Spawning Drone at (${x}, ${y})`);
             
-            if (turnDisplay) {
-                if (frame.turn !== undefined) {
-                    turnDisplay.innerText = `Turn ${frame.turn}`;
-                } else if (index === 0) {
-                    turnDisplay.innerText = `Setup`;
+            // Record existing drone IDs before spawning
+            const prevIds = new Set(engineState.drones.map(d => d.id));
+
+            try {
+                await pyodide.runPythonAsync(`
+new_id = next_drone_id
+next_drone_id += 1
+game.drones[new_id] = Drone(drone_id=new_id, player_id=${activePlayer}, x=${x}, y=${y})
+game.resolve_power_network(update_batteries=False)
+`);
+                await syncFromEngine();
+                
+                // Find the newly created drone and lock it for this turn
+                const newDrone = engineState.drones.find(d => !prevIds.has(d.id));
+                if (newDrone) actedDronesThisTurn.add(newDrone.id);
+                
+                selectedDroneId = null; 
+                showToast(`Spawned Player ${activePlayer} Drone at (${x}, ${y})!`);
+            } catch (err) {
+                logToConsole(`Python Exception during Drone spawn:\n${err.message}`, "error");
+            }
+        }
+
+        async function stepTurnInEngine() {
+            if (!isEngineReady) return showToast("Python engine is not loaded!");
+
+            await pushState(); // SAVE STATE HERE
+
+            logToConsole(`>> Advance Turn: Player ${activePlayer} confirmed turn.`);
+
+            try {
+                await pyodide.runPythonAsync(`
+# 1. Resolve network without draining batteries yet
+game.resolve_power_network(update_batteries=False)
+
+# 2. Score storm multipliers for ALL drones on the board
+for storm in game.storms:
+    sx_min, sx_max = storm.x - 1, storm.x + 1
+    sy_min, sy_max = storm.y - 1, storm.y + 1
+    for drone in game.drones.values():
+        if not drone.is_inert and (sx_min <= drone.x <= sx_max) and (sy_min <= drone.y <= sy_max):
+            game.scores[drone.player_id] += storm.multiplier
+
+# 3. Tick battery for ALL drones (both active and enemy)
+for drone in game.drones.values():
+    if drone.is_powered:
+        drone.recharge()
+    else:
+        drone.tick_battery()
+
+# 4. Advance turn & round
+game.turn += 1
+game.round = (game.turn // 2) + 1
+game.current_player = 1 if game.turn % 2 == 0 else 2
+
+# 5. End of round mechanics (storms)
+if game.turn > 0 and game.turn % 2 == 0:
+    if game.round % 25 == 0:
+        game.storms = game._place_storms()
+`);
+                // WIPE THE LOCKS FOR THE NEXT PLAYER
+                actedDronesThisTurn.clear();
+                selectedDroneId = null;
+                
+                activePlayer = (activePlayer === 1) ? 2 : 1;
+                await syncFromEngine();
+                showToast(`Turn confirmed! Now Player ${activePlayer}'s turn.`);
+            } catch (err) {
+                logToConsole(`Python Exception during turn resolution:\n${err.message}`, "error");
+            }
+        }
+
+        btnExecuteTurn.addEventListener('click', stepTurnInEngine);
+
+        // ==========================================
+        // --- CANVAS CLICK HANDLING ---
+        // ==========================================
+
+        canvas.addEventListener('click', async (e) => {
+            if (!isEngineReady) return showToast("Please upload an engine file first!");
+
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const px = (e.clientX - rect.left) * scaleX;
+            const py = (e.clientY - rect.top) * scaleY;
+            const cellSize = canvas.width / GRID_SIZE;
+            const cx = Math.floor(px / cellSize);
+            const cy = Math.floor(py / cellSize);
+
+            if (cx < 0 || cx >= GRID_SIZE || cy < 0 || cy >= GRID_SIZE) return;
+
+            const occupant = engineState.drones.find(d => d.x === cx && d.y === cy);
+
+            if (currentMode === 'SPAWN') {
+                if (cy === 0 || cy === GRID_SIZE - 1) return showToast("Cannot spawn inside Mother-Node rows!");
+                if (engineState.walls[cy][cx] === 1) return showToast("Cannot spawn inside a wall!");
+                if (occupant) return showToast("Tile is already occupied!");
+
+                await spawnDroneInEngine(cx, cy);
+            } 
+            else if (currentMode === 'COMMAND') {
+                if (selectedDroneId) {
+                    const sel = engineState.drones.find(d => d.id === selectedDroneId);
+                    if (!sel) { selectedDroneId = null; return; }
+
+                    if (sel.x === cx && sel.y === cy) {
+                        selectedDroneId = null; // deselect
+                    } 
+                    else if (Math.abs(sel.x - cx) + Math.abs(sel.y - cy) === 1) {
+                        // Adjacent click: Move or Push
+                        let dir = "UP";
+                        if (cx > sel.x) dir = "RIGHT";
+                        else if (cx < sel.x) dir = "LEFT";
+                        else if (cy > sel.y) dir = "DOWN";
+
+                        if (occupant) {
+                            await dispatchCommandToEngine(sel.id, "PUSH", dir);
+                        } else {
+                            await dispatchCommandToEngine(sel.id, "MOVE", dir);
+                        }
+                    } else if (occupant) {
+                        if (occupant.player_id !== activePlayer) {
+                            showToast(`It is Player ${activePlayer}'s turn! You cannot select enemy drone.`);
+                        } else if (actedDronesThisTurn.has(occupant.id)) {
+                            showToast(`Drone #${occupant.id} has already acted this turn!`);
+                        } else {
+                            selectedDroneId = occupant.id;
+                        }
+                    } else {
+                        selectedDroneId = null;
+                    }
                 } else {
-                    turnDisplay.innerText = `Frame ${index}`;
+                    if (occupant) {
+                        if (occupant.player_id !== activePlayer) {
+                            showToast(`It is Player ${activePlayer}'s turn!`);
+                        } else {
+                            selectedDroneId = occupant.id;
+                        }
+                    }
                 }
+                updateUI();
+                renderCanvas();
             }
-            
-            p1Score.innerText = frame.scores["1"] || 0;
-            p2Score.innerText = frame.scores["2"] || 0;
+        });
 
-            // Highlight Active Player
-            if (p1Card && p2Card) {
-                const activeP = frame.active_player;
-                if (activeP === 1) {
-                    p1Card.classList.add('ring-2', 'ring-blue-400', 'bg-blue-900/40');
-                    p2Card.classList.remove('ring-2', 'ring-red-400', 'bg-red-900/40');
-                } else if (activeP === 2) {
-                    p2Card.classList.add('ring-2', 'ring-red-400', 'bg-red-900/40');
-                    p1Card.classList.remove('ring-2', 'ring-blue-400', 'bg-blue-900/40');
-                } else {
-                    p1Card.classList.remove('ring-2', 'ring-blue-400', 'bg-blue-900/40');
-                    p2Card.classList.remove('ring-2', 'ring-red-400', 'bg-red-900/40');
-                }
-            }
+        // ==========================================
+        // --- BUTTON ACTIONS ---
+        // ==========================================
 
-            // Redraw canvas
-            renderCanvas(frame);
-        }
+        btnModeSpawn.addEventListener('click', () => {
+            currentMode = 'SPAWN';
+            btnModeSpawn.classList.add('active');
+            btnModeCommand.classList.remove('active');
+        });
 
-        // --- Rendering Engine ---
+        btnModeCommand.addEventListener('click', () => {
+            currentMode = 'COMMAND';
+            btnModeCommand.classList.add('active');
+            btnModeSpawn.classList.remove('active');
+        });
 
-        function renderCanvas(frame) {
-            // 1. Clear Canvas
+        btnCmdUp.addEventListener('click', () => selectedDroneId && dispatchCommandToEngine(selectedDroneId, "MOVE", "UP"));
+        btnCmdDown.addEventListener('click', () => selectedDroneId && dispatchCommandToEngine(selectedDroneId, "MOVE", "DOWN"));
+        btnCmdLeft.addEventListener('click', () => selectedDroneId && dispatchCommandToEngine(selectedDroneId, "MOVE", "LEFT"));
+        btnCmdRight.addEventListener('click', () => selectedDroneId && dispatchCommandToEngine(selectedDroneId, "MOVE", "RIGHT"));
+        btnCmdWait.addEventListener('click', () => selectedDroneId && dispatchCommandToEngine(selectedDroneId, "WAIT", "NONE"));
+        btnCmdPush.addEventListener('click', () => showToast("Click an adjacent drone on the grid to push it!"));
+
+        // ==========================================
+        // --- RENDERING CANVAS (100% ENGINE DRIVEN) ---
+        // ==========================================
+
+        function renderCanvas() {
+            const cellSize = canvas.width / GRID_SIZE;
+
+            // 1. Clear background
             ctx.fillStyle = COLORS.bg;
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // --- Mother-Node Glowing Effect (1 row deep) ---
-            // Player 1 (Row 0)
-            ctx.fillStyle = "rgba(59, 130, 246, 0.15)"; 
+            // 2. Mother-Nodes (Row 0 = P1 Blue, Row 49 = P2 Red)
+            ctx.fillStyle = "rgba(59, 130, 246, 0.28)";
             ctx.fillRect(0, 0, canvas.width, cellSize);
-            // Player 2 (Last row)
-            ctx.fillStyle = "rgba(239, 68, 68, 0.15)"; 
+            ctx.fillStyle = "rgba(239, 68, 68, 0.28)";
             ctx.fillRect(0, canvas.height - cellSize, canvas.width, cellSize);
 
-            // --- ISSUE 5 FIX: Draw Grid Lines ---
+            // 3. Grid Lines
             ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
             ctx.lineWidth = 1;
             ctx.beginPath();
-            for (let i = 0; i <= gridSize; i++) {
-                // Vertical lines
-                ctx.moveTo(i * cellSize, 0);
-                ctx.lineTo(i * cellSize, canvas.height);
-                // Horizontal lines
-                ctx.moveTo(0, i * cellSize);
-                ctx.lineTo(canvas.width, i * cellSize);
+            for (let i = 0; i <= GRID_SIZE; i++) {
+                ctx.moveTo(i * cellSize, 0); ctx.lineTo(i * cellSize, canvas.height);
+                ctx.moveTo(0, i * cellSize); ctx.lineTo(canvas.width, i * cellSize);
             }
             ctx.stroke();
 
-            // 2. Draw Static Walls (from root replay data)
-            if (replayData.walls) {
+            // 4. Static Walls (Directly from Python engineState.walls)
+            if (engineState.walls) {
                 ctx.fillStyle = COLORS.wall;
-                for (const w of replayData.walls) {
-                    ctx.fillRect(w.x * cellSize, w.y * cellSize, cellSize, cellSize);
+                for (let y = 0; y < GRID_SIZE; y++) {
+                    for (let x = 0; x < GRID_SIZE; x++) {
+                        if (engineState.walls[y][x] === 1) {
+                            ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+                        }
+                    }
                 }
             }
 
-            // 3. Draw Conveyor Belts
-            if (frame.belts) {
-                for (const b of frame.belts) {
-                    ctx.fillStyle = COLORS.belt;
-                    ctx.fillRect(b.x * cellSize, b.y * cellSize, cellSize, cellSize);
-                    
-                    // Direction Arrow
-                    ctx.beginPath();
-                    ctx.strokeStyle = COLORS.beltArrow;
-                    ctx.lineWidth = 2;
-                    let cx = b.x * cellSize + cellSize / 2;
-                    let cy = b.y * cellSize + cellSize / 2;
-                    ctx.moveTo(cx, cy);
-                    
-                    if (b.dir === "UP") cy -= cellSize / 3;
-                    else if (b.dir === "DOWN") cy += cellSize / 3;
-                    else if (b.dir === "LEFT") cx -= cellSize / 3;
-                    else if (b.dir === "RIGHT") cx += cellSize / 3;
-                    
-                    ctx.lineTo(cx, cy);
-                    ctx.stroke();
-                }
-            }
-
-            // 4. Draw Terminals
-            if (frame.terminals) {
-                ctx.fillStyle = COLORS.terminal;
-                ctx.shadowColor = COLORS.terminal;
-                ctx.shadowBlur = 10;
-                for (const t of frame.terminals) {
+            // 5. Terminals
+            if (engineState.terminals) {
+                ctx.fillStyle = "#06b6d4";
+                for (const t of engineState.terminals) {
                     ctx.fillRect(t.x * cellSize + 2, t.y * cellSize + 2, cellSize - 4, cellSize - 4);
                 }
-                ctx.shadowBlur = 0; // reset
             }
 
-            // --- ISSUE 4 FIX: Draw Multiple Anima Storms ---
-            if (frame.storms) {
-                ctx.fillStyle = COLORS.storm;
-                for (const s of frame.storms) {
-                    // The storm is 3x3 centered on (s.x, s.y)
+            // 6. Anima Storms (Directly from Python engineState.storms)
+            if (engineState.storms) {
+                for (const s of engineState.storms) {
+                    ctx.fillStyle = COLORS.storm;
                     ctx.fillRect((s.x - 1) * cellSize, (s.y - 1) * cellSize, cellSize * 3, cellSize * 3);
+                    ctx.strokeStyle = COLORS.stormBorder;
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeRect((s.x - 1) * cellSize, (s.y - 1) * cellSize, cellSize * 3, cellSize * 3);
+
+                    ctx.fillStyle = "#f3e8ff";
+                    ctx.font = `bold ${cellSize * 0.85}px monospace`;
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText(`+${s.multiplier}`, s.x * cellSize + cellSize / 2, s.y * cellSize + cellSize / 2);
                 }
             }
 
-            // 6. Draw Anchors (Squares)
-            if (frame.anchors) {
-                for (const a of frame.anchors) {
-                    ctx.fillStyle = a.p === 1 ? COLORS.p1 : COLORS.p2;
-                    ctx.fillRect(a.x * cellSize + 1, a.y * cellSize + 1, cellSize - 2, cellSize - 2);
-                    
-                    // Draw a directional beam indicator
-                    ctx.beginPath();
-                    ctx.strokeStyle = "#fff";
-                    ctx.lineWidth = 2;
-                    let cx = a.x * cellSize + cellSize / 2;
-                    let cy = a.y * cellSize + cellSize / 2;
-                    ctx.moveTo(cx, cy);
-                    
-                    if (a.dir === "UP") cy -= cellSize;
-                    else if (a.dir === "DOWN") cy += cellSize;
-                    else if (a.dir === "LEFT") cx -= cellSize;
-                    else if (a.dir === "RIGHT") cx += cellSize;
-                    
-                    ctx.lineTo(cx, cy);
-                    ctx.stroke();
-                }
-            }
-
-            // 7. Draw Drones (Circles)
-            if (frame.drones) {
-                for (const d of frame.drones) {
-                    const color = d.p === 1 ? COLORS.p1 : COLORS.p2;
+            // 7. Drones (Rendered 100% from Python Drone objects)
+            if (engineState.drones) {
+                for (const d of engineState.drones) {
                     const cx = d.x * cellSize + cellSize / 2;
                     const cy = d.y * cellSize + cellSize / 2;
                     const radius = (cellSize / 2) - 1.5;
+                    const baseColor = d.player_id === 1 ? COLORS.p1 : COLORS.p2;
 
                     ctx.beginPath();
                     ctx.arc(cx, cy, radius, 0, Math.PI * 2);
 
-                    if (d.inert) {
-                        // Dead/Inert: Hollow Circle with an 'X'
-                        ctx.strokeStyle = color;
-                        ctx.lineWidth = 2;
+                    if (d.is_inert) {
+                        // Inert Drone (Battery 0)
+                        ctx.strokeStyle = baseColor;
+                        ctx.lineWidth = 1.5;
                         ctx.stroke();
                         ctx.beginPath();
-                        ctx.moveTo(cx - radius/2, cy - radius/2);
-                        ctx.lineTo(cx + radius/2, cy + radius/2);
-                        ctx.moveTo(cx + radius/2, cy - radius/2);
-                        ctx.lineTo(cx - radius/2, cy + radius/2);
-                        ctx.strokeStyle = color;
-                        ctx.lineWidth = 1;
+                        ctx.moveTo(cx - radius * 0.5, cy - radius * 0.5);
+                        ctx.lineTo(cx + radius * 0.5, cy + radius * 0.5);
+                        ctx.moveTo(cx + radius * 0.5, cy - radius * 0.5);
+                        ctx.lineTo(cx - radius * 0.5, cy + radius * 0.5);
+                        ctx.strokeStyle = baseColor;
                         ctx.stroke();
-                    } else if (!d.pow) {
-                        // Unpowered but alive: Semi-transparent
-                        ctx.globalAlpha = 0.4;
-                        ctx.fillStyle = color;
+                    } else if (!d.is_powered) {
+                        // Unpowered (Battery Reserve)
+                        ctx.globalAlpha = 0.45;
+                        ctx.fillStyle = baseColor;
                         ctx.fill();
                         ctx.globalAlpha = 1.0;
-                        ctx.strokeStyle = color;
+                        ctx.strokeStyle = "#fbbf24";
+                        ctx.lineWidth = 1.8;
+                        ctx.stroke();
+
+                        ctx.fillStyle = "#fbbf24";
+                        ctx.font = `bold ${cellSize * 0.65}px sans-serif`;
+                        ctx.textAlign = "center";
+                        ctx.textBaseline = "middle";
+                        ctx.fillText(d.battery, cx, cy);
+                    } else {
+                        // Fully Powered
+                        ctx.fillStyle = baseColor;
+                        ctx.fill();
+                        ctx.strokeStyle = "#ffffff";
                         ctx.lineWidth = 1;
                         ctx.stroke();
-                    } else {
-                        // Fully powered and active
-                        ctx.fillStyle = color;
-                        ctx.fill();
+                    }
+
+                    // Selection Ring
+                    if (selectedDroneId === d.id) {
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, radius + 3, 0, Math.PI * 2);
+                        ctx.strokeStyle = "#10b981";
+                        ctx.lineWidth = 2.5;
+                        ctx.stroke();
+
+                        // Reachable cell indicators
+                        const neighbors = [{ x: d.x, y: d.y - 1 }, { x: d.x, y: d.y + 1 }, { x: d.x - 1, y: d.y }, { x: d.x + 1, y: d.y }];
+                        neighbors.forEach(n => {
+                            if (n.x >= 0 && n.x < GRID_SIZE && n.y > 0 && n.y < GRID_SIZE - 1 && engineState.walls[n.y][n.x] === 0) {
+                                ctx.fillStyle = "rgba(16, 185, 129, 0.3)";
+                                ctx.fillRect(n.x * cellSize + 2, n.y * cellSize + 2, cellSize - 4, cellSize - 4);
+                            }
+                        });
                     }
                 }
             }
         }
+
+        // ==========================================
+        // --- UI REFRESH & INSPECTOR ---
+        // ==========================================
+
+        function updateUI() {
+            uiTurn.innerText = `Turn ${engineState.turn}`;
+            uiRound.innerText = `Round ${engineState.round} / 1500`;
+
+            p1ScoreEl.innerText = engineState.scores["1"] || 0;
+            p2ScoreEl.innerText = engineState.scores["2"] || 0;
+
+            const p1Drones = engineState.drones.filter(d => d.player_id === 1);
+            const p2Drones = engineState.drones.filter(d => d.player_id === 2);
+            p1CountEl.innerText = p1Drones.length;
+            p2CountEl.innerText = p2Drones.length;
+            p1SpawnsUI.innerText = p1Spawns; // NEW
+            p2SpawnsUI.innerText = p2Spawns; // NEW
+            totalDronesCount.innerText = engineState.drones.length;
+
+            let wallCount = 0;
+            if (engineState.walls) {
+                for (let r of engineState.walls) for (let c of r) if (c === 1) wallCount++;
+            }
+            totalWallsCount.innerText = wallCount;
+            totalStormsCount.innerText = engineState.storms ? engineState.storms.length : 0;
+
+            if (activePlayer === 1) {
+                activeDot.className = "w-2.5 h-2.5 rounded-full bg-blue-500 shadow-[0_0_8px_#3b82f6]";
+                activeText.innerText = "Player 1's Turn";
+                activeBanner.className = "flex items-center gap-2 px-3 py-1.5 rounded-lg border border-blue-800 bg-blue-950/60 text-blue-300 text-xs font-bold";
+                p1ScoreCard.className = "flex items-center gap-3 bg-blue-950 border-2 border-blue-400 px-4 py-1.5 rounded-xl shadow-[0_0_20px_rgba(59,130,246,0.5)]";
+                p2ScoreCard.className = "flex items-center gap-3 bg-red-950/40 border border-red-900/40 px-4 py-1.5 rounded-xl opacity-60";
+                spawnModeLabel.innerText = "Spawn P1 Drone";
+                spawnModeLabel.className = "block font-bold text-blue-400 text-xs";
+                turnLockIndicator.innerText = "P1 Active";
+                turnLockIndicator.className = "text-[10px] text-blue-400 font-bold";
+                payloadPlayerBadge.innerText = "P1 Vision Payload (5x5)";
+                payloadPlayerBadge.className = "text-[10px] font-mono font-bold text-blue-400";
+            } else {
+                activeDot.className = "w-2.5 h-2.5 rounded-full bg-red-500 shadow-[0_0_8px_#ef4444]";
+                activeText.innerText = "Player 2's Turn";
+                activeBanner.className = "flex items-center gap-2 px-3 py-1.5 rounded-lg border border-red-800 bg-red-950/60 text-red-300 text-xs font-bold";
+                p2ScoreCard.className = "flex items-center gap-3 bg-red-950 border-2 border-red-400 px-4 py-1.5 rounded-xl shadow-[0_0_20px_rgba(239,68,68,0.5)]";
+                p1ScoreCard.className = "flex items-center gap-3 bg-blue-950/40 border border-blue-900/40 px-4 py-1.5 rounded-xl opacity-60";
+                spawnModeLabel.innerText = "Spawn P2 Drone";
+                spawnModeLabel.className = "block font-bold text-red-400 text-xs";
+                turnLockIndicator.innerText = "P2 Active";
+                turnLockIndicator.className = "text-[10px] text-red-400 font-bold";
+                payloadPlayerBadge.innerText = "P2 Vision Payload (5x5)";
+                payloadPlayerBadge.className = "text-[10px] font-mono font-bold text-red-400";
+            }
+
+            // Inspector Update
+            const selDrone = engineState.drones.find(d => d.id === selectedDroneId);
+            if (selDrone) {
+                inspectorContent.classList.remove('opacity-40', 'pointer-events-none');
+                inspDroneId.innerText = `Drone #${selDrone.id}`;
+                inspPos.innerText = `P${selDrone.player_id} @ (${selDrone.x}, ${selDrone.y})`;
+
+                if (selDrone.is_inert) {
+                    inspPoweredBadge.className = "px-2 py-0.5 rounded text-[10px] font-bold bg-red-950 text-red-400 border border-red-800";
+                    inspPoweredBadge.innerText = "False (Inert)";
+                    inspInertBadge.innerText = "True";
+                    inspInertBadge.className = "font-mono font-bold text-red-400";
+                } else if (!selDrone.is_powered) {
+                    inspPoweredBadge.className = "px-2 py-0.5 rounded text-[10px] font-bold bg-yellow-950 text-yellow-400 border border-yellow-800";
+                    inspPoweredBadge.innerText = "False (Reserve)";
+                    inspInertBadge.innerText = "False";
+                    inspInertBadge.className = "font-mono font-bold text-gray-400";
+                } else {
+                    inspPoweredBadge.className = "px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-800";
+                    inspPoweredBadge.innerText = "True (Connected)";
+                    inspInertBadge.innerText = "False";
+                    inspInertBadge.className = "font-mono font-bold text-gray-400";
+                }
+
+                inspBatteryVal.innerText = `${selDrone.battery}/3`;
+                inspBatteryMeter.innerHTML = "";
+                for (let i = 0; i < 3; i++) {
+                    const dot = document.createElement('span');
+                    dot.className = `w-3 h-3 rounded ${i < selDrone.battery ? (selDrone.is_powered ? 'bg-emerald-500' : 'bg-yellow-400') : 'bg-gray-800 border border-gray-700'}`;
+                    inspBatteryMeter.appendChild(dot);
+                }
+            } else {
+                inspectorContent.classList.add('opacity-40', 'pointer-events-none');
+                inspDroneId.innerText = "None Selected";
+                inspPos.innerText = "-";
+                inspPoweredBadge.className = "px-2 py-0.5 rounded text-[10px] font-bold bg-gray-800 text-gray-500";
+                inspPoweredBadge.innerText = "None";
+                inspBatteryVal.innerText = "0/3";
+                inspInertBadge.innerText = "-";
+                inspBatteryMeter.innerHTML = `
+                    <span class="w-3 h-3 rounded bg-gray-800"></span>
+                    <span class="w-3 h-3 rounded bg-gray-800"></span>
+                    <span class="w-3 h-3 rounded bg-gray-800"></span>
+                `;
+            }
+
+            // Fog of War Payload Display
+            if (engineState.payload) {
+                payloadJson.innerText = JSON.stringify(engineState.payload, null, 2);
+            }
+        }
+
+        // ==========================================
+        // --- LOGGING & TOASTS ---
+        // ==========================================
+
+        function logToConsole(msg, type = "normal") {
+            const row = document.createElement('div');
+            const timeStr = new Date().toLocaleTimeString();
+            if (type === "error") {
+                row.className = "text-red-400 font-bold";
+                row.innerText = `[${timeStr}] ❌ ${msg}`;
+            } else if (type === "success") {
+                row.className = "text-emerald-400 font-bold";
+                row.innerText = `[${timeStr}] ✅ ${msg}`;
+            } else if (type === "system") {
+                row.className = "text-indigo-400 font-semibold";
+                row.innerText = `[${timeStr}] ℹ️ ${msg}`;
+            } else {
+                row.className = "text-gray-300";
+                row.innerText = `[${timeStr}] ${msg}`;
+            }
+            engineLog.appendChild(row);
+            engineLog.scrollTop = engineLog.scrollHeight;
+        }
+
+        btnClearLog.addEventListener('click', () => { engineLog.innerHTML = ""; });
+
+        let toastTimer = null;
+        function showToast(msg) {
+            toastEl.innerText = msg;
+            toastEl.classList.remove('opacity-0');
+            toastEl.classList.add('opacity-100');
+            if (toastTimer) clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => {
+                toastEl.classList.remove('opacity-100');
+                toastEl.classList.add('opacity-0');
+            }, 2500);
+        }
+
+        // Initialize Engine on load
+        window.addEventListener('load', initEngine);
     </script>
 </body>
 </html>
