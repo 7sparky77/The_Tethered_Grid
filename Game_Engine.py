@@ -218,10 +218,11 @@ class GameState:
                             return True
         return False
 
-    def resolve_power_network(self):
+    def resolve_power_network(self, update_batteries: bool = True):
         """
         The Engine Heartbeat for Power:
         Recalculates the entire tether grid using Breadth-First Search (BFS).
+        If update_batteries is False, only updates is_powered status without draining/recharging batteries.
         """
         powered_drone_ids = set()
         
@@ -249,10 +250,14 @@ class GameState:
         for drone in self.drones.values():
             if drone.drone_id in powered_drone_ids:
                 drone.is_powered = True
-                drone.recharge() # Tops off the battery up to 3 and removes inert status
+                if update_batteries:
+                    drone.recharge() # Tops off the battery up to 3 and removes inert status
+                else:
+                    drone.is_inert = False
             else:
                 drone.is_powered = False
-                drone.tick_battery() # Subtracts 1 from battery. If 0, becomes inert.
+                if update_batteries:
+                    drone.tick_battery() # Subtracts 1 from battery. If 0, becomes inert.
 
     def is_valid_cell(self, x: int, y: int) -> bool:
         """Helper to check if coordinates are within the 50x50 grid."""
@@ -263,13 +268,25 @@ class GameState:
         Executes a player's array of commands strictly in order.
         Example cmd: {"drone_id": 5, "action": "PUSH", "direction": Direction.UP}
         """
+        # FIX: Track which drones have already acted this turn to prevent multi-action cheating
+        processed_drones = set()
+        
         for cmd in commands:
-            drone = self.drones.get(cmd.get("drone_id"))
+            drone_id = cmd.get("drone_id")
             
-            # Validation: Drone must exist, belong to the player, and be POWERED.
-            if not drone or drone.player_id != player_id or not drone.is_powered:
+            # Enforce strict limit: 1 action per drone per turn
+            if drone_id in processed_drones:
                 continue
                 
+            drone = self.drones.get(drone_id)
+            
+            # Validation: Drone must exist, belong to player, and NOT be inert.
+            if not drone or drone.player_id != player_id or drone.is_inert:
+                continue
+                
+            # Mark this drone as having used its action for this turn
+            processed_drones.add(drone_id)
+            
             action = cmd.get("action")
             
             # ---------------------------------------------------------
@@ -396,7 +413,7 @@ class GameState:
             storm.x, storm.y = new_x, new_y
 
     def end_of_round_mechanics(self):
-        # 1. MOVE DRONES ON BELTS (ISSUE 3 FIX)
+        # 1. MOVE DRONES ON BELTS
         for drone in list(self.drones.values()):
             belt_dir = self.conveyor_grid[drone.y][drone.x]
             if belt_dir:
@@ -411,7 +428,7 @@ class GameState:
                     if self.get_entity_at(nx, ny) is None:
                         drone.x, drone.y = nx, ny
 
-        # 2. WIPE OLD BELTS EVERY ROUND (ISSUE 2 FIX)
+        # 2. WIPE OLD BELTS EVERY ROUND
         self.conveyor_grid = [[None for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
 
         # 3. SPAWN 2 NEW BELTS
@@ -431,29 +448,8 @@ class GameState:
                 tx, ty = self.get_random_empty_cell(10, 40)
                 terminal.x, terminal.y = tx, ty
                 
-        # Every 25 full rounds, regenerate storms so they stay fresh and non-overlapping.
-        # Uses self.round (1-1500), not self.turn (0-2999), so the cadence is correct.
-        if self.round % 25 == 0:
+        if self.round > 0 and self.round % 25 == 0:
             self.storms = self._place_storms()
-                
-        self.resolve_power_network()
-        
-        for storm in self.storms:
-            sx_min, sx_max = storm.x - 1, storm.x + 1
-            sy_min, sy_max = storm.y - 1, storm.y + 1
-            for drone in self.drones.values():
-                if drone.is_powered and (sx_min <= drone.x <= sx_max) and (sy_min <= drone.y <= sy_max):
-                    self.scores[drone.player_id] += storm.multiplier
-
-    def initialize_replay(self):
-        """Called once at the very start of the match to log static terrain."""
-        self.replay_data["grid_size"] = GRID_SIZE
-        
-        # Log walls only once
-        for y in range(GRID_SIZE):
-            for x in range(GRID_SIZE):
-                if self.walls_grid[y][x] == 1:
-                    self.replay_data["walls"].append({"x": x, "y": y})
 
     def record_frame(self):
         """Called at the end of every round to snapshot the board."""
@@ -669,7 +665,7 @@ def get_commands_from_bot(player_id: int, payload: dict) -> list:
             print(f"Error communicating with Player {player_id} Bot: {e}")
         return []
 
-def play_match(p1_cmd="", p2_cmd=""):
+def play_match(p1_cmd="", p2_cmd="", custom_drones: Optional[List[Dict]] = None):
     game = GameState()
     
     # Boot up the bot processes
@@ -697,26 +693,36 @@ def play_match(p1_cmd="", p2_cmd=""):
         tx, ty = game.get_random_empty_cell(10, 40)
         game.terminals.append(Terminal(terminal_id=i, x=tx, y=ty))
 
-    # C. Spawn 25 Drones per player (P1 on row 1, P2 on row 48)
+    # C. Spawn Drones (Custom chosen squares or default 25 per player)
     drone_counter = 1
-    p1_occupied_x = set()
-    p2_occupied_x = set()
-    for i in range(25):
-        # Player 1: find an unoccupied X on row 1
-        x1 = random.randint(0, GRID_SIZE - 1)
-        while x1 in p1_occupied_x:
+    if custom_drones:
+        for cd in custom_drones:
+            pid = cd.get("player_id", 1)
+            cx, cy = cd.get("x"), cd.get("y")
+            if game.is_valid_cell(cx, cy) and cy not in [0, GRID_SIZE - 1] and game.walls_grid[cy][cx] == 0:
+                if game.get_entity_at(cx, cy) is None:
+                    game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=pid, x=cx, y=cy)
+                    drone_counter += 1
+    else:
+        # Default: 25 Drones per player (P1 on row 1, P2 on row 48)
+        p1_occupied_x = set()
+        p2_occupied_x = set()
+        for i in range(25):
             x1 = random.randint(0, GRID_SIZE - 1)
-        p1_occupied_x.add(x1)
-        game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=1, x=x1, y=1)
-        drone_counter += 1
+            while x1 in p1_occupied_x:
+                x1 = random.randint(0, GRID_SIZE - 1)
+            p1_occupied_x.add(x1)
+            game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=1, x=x1, y=1)
+            drone_counter += 1
 
-        # Player 2: find an unoccupied X on row 48
-        x2 = random.randint(0, GRID_SIZE - 1)
-        while x2 in p2_occupied_x:
             x2 = random.randint(0, GRID_SIZE - 1)
-        p2_occupied_x.add(x2)
-        game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=2, x=x2, y=GRID_SIZE - 2)
-        drone_counter += 1
+            while x2 in p2_occupied_x:
+                x2 = random.randint(0, GRID_SIZE - 1)
+            p2_occupied_x.add(x2)
+            game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=2, x=x2, y=GRID_SIZE - 2)
+            drone_counter += 1
+
+    game.resolve_power_network(update_batteries=False)
 
     game.resolve_power_network()
     
@@ -747,8 +753,24 @@ def play_match(p1_cmd="", p2_cmd=""):
         # 3. Apply board mechanics after BOTH players have gone (every 1 full round = 2 turns)
         if turn % 2 == 1:
             game.end_of_round_mechanics()
+            
+        # 4. UNIVERSAL TURN MECHANICS: Resolve power, Score, and Drain Battery for ALL drones
+        game.resolve_power_network(update_batteries=False)
+        
+        for storm in game.storms:
+            sx_min, sx_max = storm.x - 1, storm.x + 1
+            sy_min, sy_max = storm.y - 1, storm.y + 1
+            for drone in game.drones.values():
+                if not drone.is_inert and (sx_min <= drone.x <= sx_max) and (sy_min <= drone.y <= sy_max):
+                    game.scores[drone.player_id] += storm.multiplier
+                    
+        for drone in game.drones.values():
+            if drone.is_powered:
+                drone.recharge()
+            else:
+                drone.tick_battery()
 
-        # 4. Record the frame so the visualizer shows every single step back-and-forth
+        # 5. Record the frame so the visualizer shows every single step back-and-forth
         game.record_frame()
         
     # 3. Game Over! Save the visualizer file securely in the project folder.
