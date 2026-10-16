@@ -57,14 +57,15 @@
         <div class="flex flex-col items-center">
             <span class="text-xs text-gray-400 uppercase tracking-widest">Round</span>
             <span id="roundDisplay" class="font-bold text-white text-xl">0 / 0</span>
+            <span id="turnDisplay" class="text-[11px] text-gray-500 font-mono tracking-tight">Setup</span>
         </div>
         <div class="h-8 w-px bg-gray-700"></div>
-        <div class="flex items-center gap-4 bg-blue-950/30 border border-blue-900/50 px-4 py-1 rounded-lg">
+        <div id="p1Card" class="flex items-center gap-4 bg-blue-950/30 border border-blue-900/50 px-4 py-1 rounded-lg transition-all duration-150">
             <div class="w-3 h-3 rounded-full bg-blue-500 shadow-[0_0_8px_#3b82f6]"></div>
             <span class="text-blue-400 font-semibold uppercase tracking-wide text-sm">Player 1</span>
             <span id="p1Score" class="font-bold text-2xl text-white ml-2">0</span>
         </div>
-        <div class="flex items-center gap-4 bg-red-950/30 border border-red-900/50 px-4 py-1 rounded-lg">
+        <div id="p2Card" class="flex items-center gap-4 bg-red-950/30 border border-red-900/50 px-4 py-1 rounded-lg transition-all duration-150">
             <span id="p2Score" class="font-bold text-2xl text-white mr-2">0</span>
             <span class="text-red-400 font-semibold uppercase tracking-wide text-sm">Player 2</span>
             <div class="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_8px_#ef4444]"></div>
@@ -143,8 +144,11 @@
         
         // UI Displays
         const roundDisplay = document.getElementById('roundDisplay');
+        const turnDisplay = document.getElementById('turnDisplay');
         const p1Score = document.getElementById('p1Score');
         const p2Score = document.getElementById('p2Score');
+        const p1Card = document.getElementById('p1Card');
+        const p2Card = document.getElementById('p2Card');
         
         // Controls
         const frameSlider = document.getElementById('frameSlider');
@@ -293,9 +297,37 @@
             
             // Update UI components
             frameSlider.value = index;
-            roundDisplay.innerText = `${frame.round} / ${replayData.frames.length - 1}`;
+            const lastFrame = replayData.frames[replayData.frames.length - 1];
+            const totalRounds = (lastFrame && lastFrame.round > 0) ? lastFrame.round : Math.max(1, Math.floor((replayData.frames.length - 1) / 2));
+            roundDisplay.innerText = `${frame.round} / ${totalRounds}`;
+            
+            if (turnDisplay) {
+                if (frame.turn !== undefined) {
+                    turnDisplay.innerText = `Turn ${frame.turn}`;
+                } else if (index === 0) {
+                    turnDisplay.innerText = `Setup`;
+                } else {
+                    turnDisplay.innerText = `Frame ${index}`;
+                }
+            }
+            
             p1Score.innerText = frame.scores["1"] || 0;
             p2Score.innerText = frame.scores["2"] || 0;
+
+            // Highlight Active Player
+            if (p1Card && p2Card) {
+                const activeP = frame.active_player;
+                if (activeP === 1) {
+                    p1Card.classList.add('ring-2', 'ring-blue-400', 'bg-blue-900/40');
+                    p2Card.classList.remove('ring-2', 'ring-red-400', 'bg-red-900/40');
+                } else if (activeP === 2) {
+                    p2Card.classList.add('ring-2', 'ring-red-400', 'bg-red-900/40');
+                    p1Card.classList.remove('ring-2', 'ring-blue-400', 'bg-blue-900/40');
+                } else {
+                    p1Card.classList.remove('ring-2', 'ring-blue-400', 'bg-blue-900/40');
+                    p2Card.classList.remove('ring-2', 'ring-red-400', 'bg-red-900/40');
+                }
+            }
 
             // Redraw canvas
             renderCanvas(frame);
@@ -308,13 +340,13 @@
             ctx.fillStyle = COLORS.bg;
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // --- ISSUE 1 FIX: Mother-Node Glowing Effect ---
-            // Player 1 (Top 2 rows)
+            // --- Mother-Node Glowing Effect (1 row deep) ---
+            // Player 1 (Row 0)
             ctx.fillStyle = "rgba(59, 130, 246, 0.15)"; 
-            ctx.fillRect(0, 0, canvas.width, cellSize * 2);
-            // Player 2 (Bottom 2 rows)
+            ctx.fillRect(0, 0, canvas.width, cellSize);
+            // Player 2 (Last row)
             ctx.fillStyle = "rgba(239, 68, 68, 0.15)"; 
-            ctx.fillRect(0, canvas.height - cellSize * 2, canvas.width, cellSize * 2);
+            ctx.fillRect(0, canvas.height - cellSize, canvas.width, cellSize);
 
             // --- ISSUE 5 FIX: Draw Grid Lines ---
             ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
