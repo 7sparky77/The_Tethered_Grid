@@ -107,13 +107,12 @@ Conveyor Belts exist in three types:
 **Type 1: Striped Conveyor Belts**
 - A stripe of random length (**4–6 cells**) appears, either horizontally or vertically placed.
 - There are **5 pairs**, each appearing randomly every **20–30 turns**.
-- The difference between the number of horizontal and vertical stripes is always exactly 1:
-
-  `|Number of Horizontal Stripes - Number of Vertical Stripes| = 1`
+- `|Number of pair of Horizontal Stripes - Number of pair of Vertical Stripes| = 1`
 
 **Type 2: Single-Cell Conveyor Belts**
 - A single-cell Conveyor Belt appears directly underneath an Active Drone of each player.
 - Afterward, they relocate randomly every **6 turns**, underneath a randomly selected Active Drone of each player.
+- They do not occur for that player who has no Active Drone.
 
 **Type 3: Terminal-Created Conveyor Belts**
 - Conveyor Belts created using Terminals remain active for the current turn and the next turn.
