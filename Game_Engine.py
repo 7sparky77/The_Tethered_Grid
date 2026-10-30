@@ -1,43 +1,123 @@
-import random
-import os
-import sys
-import subprocess
-import json
-from enum import Enum
-from typing import List, Dict, Optional, Tuple
+"""
+The Tethered Grid - Game Engine (pure rules, no process / file I/O).
 
-# Constants
+This file only knows the rules. Running real bot processes lives in
+Match_Runner.py, so this file can also be loaded inside the browser
+(Visualizer.html runs it through Pyodide).
+
+Coordinates: x = column (0..49, left -> right), y = row (0..49, top -> bottom).
+UP means y - 1. Player 1's Mother-Node is row 0, Player 2's is row 49.
+
+One "turn" = one player's move. Turns alternate P1, P2, P1, ...
+A full turn for the active player runs in this order (see RULES.md):
+    begin_turn()     -> conveyor belts move that player's drones, power is
+                        recomputed, the fog-of-war payload is built
+    apply_commands() -> the player's commands run one by one, in array order
+    end_turn()       -> power recomputed, batteries tick, the player scores,
+                        terminal / storm timers tick, a replay frame is saved
+"""
+
+import random
+from collections import deque
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Tunable constants (every number the rules mention lives here)
+# ---------------------------------------------------------------------------
 GRID_SIZE = 50
-MAX_DRONE_BATTERY = 3
-TERMINAL_LIFESPAN = 50
+DRONES_PER_PLAYER = 25          # each player's total supply of drones (no respawn)
+STARTING_DRONES = 0             # placed on row 1 / 48 at the start; the rest wait in reserve
+SPAWNS_PER_TURN = 5             # SPAWN commands allowed per turn
+CRUSH_ACTIVE_DRONES = True      # PUSH into a solid cell destroys ANY drone (False: inert only)
+MAX_TURNS = 3000                # total turns (P1 and P2 get 1500 each)
+MAX_BATTERY = 5                 # drains 1 on EVERY turn (both players') while cut off
+TETHER_RANGE = 5                # max Chebyshev distance of a power link
+VISION_RADIUS = 2               # 5x5 vision around every active unit
+ANCHOR_HP = 3
+ANCHOR_BEAM_RANGE = 5
+SABOTAGE_RADIUS = 2             # 5x5 defense region around an anchor
+TERMINAL_PAIRS = 3              # 6 terminals on the map (3 mirrored pairs)
+TERMINAL_LIFESPAN = (40, 50)    # turns before a terminal pair relocates (random in range 40..50)
+STORM_PAIRS = 4                 # 8 Anima Storms (4 mirrored pairs)
+STORM_LIFESPAN = (40, 50)       # turns a storm pair lives (random in range 40..50)
+STORM_ROWS = (10, 39)           # every storm cell lies in these rows (public knowledge)
+WALL_SEGMENT_PAIRS = 10
+WALL_FREE_ROWS = (15, 34)       # no walls in the middle of the board
+BELT_STRIPE_PAIRS = 5           # 10 belt stripes (5 mirrored pairs)
+BELT_STRIPE_LIFESPAN = (20, 30) # turns a belt stripe pair lives (random in range 20..30)
+BELT_STRIPE_LENGTH = (4, 6)     # length of each stripe (random in range 4..6)
+BELT_DRONE_INTERVAL = 6         # random 1-cell belt under each player's drone every 6 turns
+MAX_FEEDBACK = 50               # rejected-command messages sent back per turn
+MAX_COMMANDS = 200              # commands read per turn; the rest are ignored
+
+MOTHER_ROW = {1: 0, 2: GRID_SIZE - 1}
+
 
 class Direction(Enum):
     UP = (0, -1)
     DOWN = (0, 1)
     LEFT = (-1, 0)
     RIGHT = (1, 0)
-    NONE = (0, 0)
 
+    @property
+    def dx(self) -> int:
+        return self.value[0]
+
+    @property
+    def dy(self) -> int:
+        return self.value[1]
+
+    def mirrored(self) -> "Direction":
+        """Direction after the 180-degree map rotation used for fairness."""
+        return {Direction.UP: Direction.DOWN, Direction.DOWN: Direction.UP,
+                Direction.LEFT: Direction.RIGHT, Direction.RIGHT: Direction.LEFT}[self]
+
+
+def parse_direction(value) -> Optional[Direction]:
+    if isinstance(value, Direction):
+        return value
+    if isinstance(value, str) and value.upper() in Direction.__members__:
+        return Direction[value.upper()]
+    return None
+
+
+def mirror(x: int, y: int) -> Tuple[int, int]:
+    """Point reflection through the centre: P1's view of the map == P2's."""
+    return GRID_SIZE - 1 - x, GRID_SIZE - 1 - y
+
+
+def is_int(value) -> bool:
+    """JSON integers only (bool is a subclass of int in Python, so exclude it)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def chebyshev(x1: int, y1: int, x2: int, y2: int) -> int:
+    return max(abs(x1 - x2), abs(y1 - y2))
+
+
+# ---------------------------------------------------------------------------
+# Entities
+# ---------------------------------------------------------------------------
 class Drone:
     def __init__(self, drone_id: int, player_id: int, x: int, y: int):
         self.drone_id = drone_id
         self.player_id = player_id
         self.x = x
         self.y = y
-        self.battery = MAX_DRONE_BATTERY
-        self.is_powered = True  # True if connected to grid
-        self.is_inert = False   # True if battery reaches 0
-    
-    def tick_battery(self):
-        if not self.is_powered and not self.is_inert:
-            self.battery -= 1
-            if self.battery <= 0:
-                self.is_inert = True
-    
-    def recharge(self):
-        if self.is_powered:
-            self.is_inert = False
-            self.battery = min(MAX_DRONE_BATTERY, self.battery + 1)
+        self.battery = MAX_BATTERY
+        self.is_powered = True                  # connected to the tether network
+        self.power_source: Optional[Tuple[int, int]] = None   # cell it draws power from
+
+    @property
+    def is_inert(self) -> bool:
+        """Cut off from the network AND out of battery: cannot act, does not see."""
+        return not self.is_powered and self.battery <= 0
+
+    @property
+    def is_active(self) -> bool:
+        return not self.is_inert
+
 
 class Anchor:
     def __init__(self, anchor_id: int, player_id: int, x: int, y: int, direction: Direction):
@@ -45,761 +125,1037 @@ class Anchor:
         self.player_id = player_id
         self.x = x
         self.y = y
-        self.direction = direction # The single orthogonal direction it beams power
-        self.hp = 3
+        self.direction = direction              # the one orthogonal direction it beams power
+        self.hp = ANCHOR_HP
+
 
 class Terminal:
-    def __init__(self, terminal_id: int, x: int, y: int):
+    def __init__(self, terminal_id: int, x: int, y: int, timer: int):
         self.terminal_id = terminal_id
         self.x = x
         self.y = y
-        self.timer = TERMINAL_LIFESPAN
+        self.timer = timer                      # turns left before it relocates
+
+
+class BeltStripePair:
+    def __init__(self, pair_id: int, orientation: str):
+        self.pair_id = pair_id
+        self.orientation = orientation          # 'H' or 'V'
+        self.timer = 0                          # turns left before it relocates
+        self.cells: List[Tuple[int, int]] = []
+        self.mirror_cells: List[Tuple[int, int]] = []
+
 
 class AnimaStorm:
-    def __init__(self, x: int, y: int, multiplier: int):
-        self.x = x  # Top-left corner of the 3x3 storm
+    def __init__(self, storm_id: int, x: int, y: int, multiplier: int, timer: int):
+        self.storm_id = storm_id
+        self.x = x                              # centre of the 3x3 zone
         self.y = y
         self.multiplier = multiplier
+        self.timer = timer                      # turns left before it fades
 
+    def contains(self, x: int, y: int) -> bool:
+        return abs(x - self.x) <= 1 and abs(y - self.y) <= 1
+
+    def cells(self) -> List[Tuple[int, int]]:
+        return [(self.x + dx, self.y + dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+
+
+def storm_multiplier(center_y: int) -> int:
+    """Storms closer to the middle row are worth more, to pull both swarms together."""
+    distance = abs(center_y - (GRID_SIZE - 1) / 2)
+    if distance <= 1.5:
+        return 3
+    if distance <= 3.5:
+        return 2
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Game state
+# ---------------------------------------------------------------------------
 class GameState:
-    def __init__(self):
-        self.turn = 0
-        self.round = 0
-        self.current_player = 1
-        
-        # Player 1 Mother-Node is row 0. Player 2 Mother-Node is row 49 (GRID_SIZE - 1).
+    def __init__(self, seed: Optional[int] = None, generate_map: bool = True,
+                 spawn_drones: bool = True, max_turns: int = MAX_TURNS):
+        self.seed = seed if seed is not None else random.randrange(1, 10 ** 9)
+        self.rng = random.Random(self.seed)
+        self.max_turns = max_turns
+        self.turn = 0                           # 0-based; even = P1, odd = P2
         self.scores = {1: 0, 2: 0}
-        
-        # Entity Storage
+        self.reserve = {1: DRONES_PER_PLAYER, 2: DRONES_PER_PLAYER}   # drones not yet spawned
+        self.spawned_this_turn = 0
+
+        self.walls: set = set()
+        self.belts: Dict[Tuple[int, int], Direction] = {}
+        self.belt_stripes: List[BeltStripePair] = []
+        self.belt_drone_timer = BELT_DRONE_INTERVAL
+        self.drone_belt_cells: List[Tuple[int, int]] = []
+        self.terminal_belts: Dict[Tuple[int, int], int] = {}
         self.drones: Dict[int, Drone] = {}
         self.anchors: Dict[int, Anchor] = {}
-        self.terminals: List[Terminal] = []
-        
-        # 50x50 Grid matrices to store environmental data
-        # 0 = Empty, 1 = Normal Wall (#)
-        self.walls_grid = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-        
-        # Stores Direction enums for conveyor belts. NONE = no belt.
-        self.conveyor_grid = [[None for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-        self.storms = self._place_storms()
+        self.terminals: List[Terminal] = []     # stored in mirrored pairs: [0,1], [2,3], ...
+        self.storms: List[AnimaStorm] = []      # same pairing as terminals
+        self.occupant: Dict[Tuple[int, int], object] = {}   # cell -> Drone / Anchor
 
-        # Replay Data Storage
-        self.replay_data = {
-            "grid_size": GRID_SIZE,
-            "walls": [],
-            "frames": []
-        }
+        self.next_drone_id = 1
+        self.next_anchor_id = 1
+        self.next_storm_id = 1
 
-    def _place_storms(self, count: int = 10) -> list:
-        """
-        Generates 'count' non-overlapping AnimaStorms spread across the grid interior.
+        self.stats = {p: {"crushed_enemies": 0, "drones_lost": 0, "anchors_built": 0,
+                          "anchors_destroyed": 0, "hacks": 0} for p in (1, 2)}
+        self.feedback: Dict[int, List[str]] = {1: [], 2: []}
+        self.events: List[dict] = []            # what happened during the current turn
 
-        Constraints (on 50x50 grid):
-          - Storm center y in [11, 38] so the 3x3 footprint (center ± 1) never
-            touches rows 0-9 (P1 Mother-Node area) or rows 40-49 (P2 Mother-Node area).
-          - Storm center x in [2, 47] so the 3x3 footprint stays inside the grid.
-          - Two storms are considered overlapping when BOTH |dx| < 3 AND |dy| < 3
-            (i.e. their 3x3 areas share at least one cell). Placement rejects these.
-          - The valid area is split into a 5-column × 2-row sub-grid (10 cells) so
-            one storm is seeded per region, preventing clustering at the centre.
-        """
-        storms = []
-        x_min, x_max = 2, 47   # keeps 3x3 footprint inside columns 1..48
-        y_min, y_max = 11, 38  # keeps 3x3 footprint inside rows 10..39
+        # Per-turn bookkeeping filled by begin_turn()
+        self.turn_started = False
+        self.can_act: set = set()
+        self.acted: set = set()
+        self.turn_vision: set = set()
 
-        # ── Phase 1: one candidate per sub-region for even distribution ──────
-        cols_n, rows_n = 5, 2
-        x_step = (x_max - x_min + 1) // cols_n   # ≈9
-        y_step = (y_max - y_min + 1) // rows_n   # ≈14
+        self.frames: List[dict] = []
+        self._last_belts = None
 
-        candidates = []
-        for row in range(rows_n):
-            for col in range(cols_n):
-                rx_min = x_min + col * x_step
-                rx_max = min(x_max, rx_min + x_step - 1)
-                ry_min = y_min + row * y_step
-                ry_max = min(y_max, ry_min + y_step - 1)
-                candidates.append((random.randint(rx_min, rx_max),
-                                   random.randint(ry_min, ry_max)))
+        if generate_map:
+            self._generate_map()
+        if spawn_drones:
+            self._spawn_starting_drones()
+        self.recompute_power()
+        self.record_frame()
 
-        random.shuffle(candidates)
-        for cx, cy in candidates:
-            if len(storms) >= count:
-                break
-            if any(abs(cx - s.x) < 3 and abs(cy - s.y) < 3 for s in storms):
-                continue  # overlaps an existing storm
-            storms.append(AnimaStorm(x=cx, y=cy, multiplier=random.randint(1, 3)))
+    # -----------------------------------------------------------------------
+    # Basic queries
+    # -----------------------------------------------------------------------
+    @property
+    def current_player(self) -> int:
+        return 1 if self.turn % 2 == 0 else 2
 
-        # ── Phase 2: rejection-sample any remaining slots ─────────────────────
-        attempts = 0
-        while len(storms) < count and attempts < 2000:
-            attempts += 1
-            cx = random.randint(x_min, x_max)
-            cy = random.randint(y_min, y_max)
-            if not any(abs(cx - s.x) < 3 and abs(cy - s.y) < 3 for s in storms):
-                storms.append(AnimaStorm(x=cx, y=cy, multiplier=random.randint(1, 3)))
+    @property
+    def is_over(self) -> bool:
+        return self.turn >= self.max_turns
 
-        return storms
-
-    def get_entity_at(self, x: int, y: int):
-        # Helper to check if a tile is occupied by a Drone or Anchor
-        for drone in self.drones.values():
-            if drone.x == x and drone.y == y: return drone
-        for anchor in self.anchors.values():
-            if anchor.x == x and anchor.y == y: return anchor
-        return None
-
-    def is_cell_blocked_for_los(self, x: int, y: int, player_id: int) -> bool:
-        """Returns True if a cell contains a Wall or an ENEMY unit (active or inert)."""
-        if self.walls_grid[y][x] == 1:
-            return True
-        
-        entity = self.get_entity_at(x, y)
-        if entity is not None and entity.player_id != player_id:
-            return True
-            
-        return False
-
-    def has_los(self, x1: int, y1: int, x2: int, y2: int, player_id: int) -> bool:
-        """Calculates if there is a clear orthogonal/diagonal path between two points (Max 5 cells)."""
-        # Calculate Chebyshev distance (max of x-diff or y-diff)
-        dist = max(abs(x1 - x2), abs(y1 - y2))
-        
-        # Rule check: Must be within 5 cells, and cannot be the exact same cell
-        if dist > 5 or dist == 0:
-            return False
-            
-        # Rule check: Must be a perfectly straight line (Orthogonal or Diagonal)
-        dx = x2 - x1
-        dy = y2 - y1
-        if dx != 0 and dy != 0 and abs(dx) != abs(dy):
-            return False 
-            
-        # Determine the step direction (-1, 0, or 1) for the raycast
-        step_x = 0 if dx == 0 else (1 if dx > 0 else -1)
-        step_y = 0 if dy == 0 else (1 if dy > 0 else -1)
-        
-        # Raycast: Step through each cell between point 1 and point 2
-        cx, cy = x1 + step_x, y1 + step_y
-        while (cx, cy) != (x2, y2):
-            if self.is_cell_blocked_for_los(cx, cy, player_id):
-                return False
-            cx += step_x
-            cy += step_y
-            
-        return True
-
-    def check_mother_node_connection(self, drone: Drone) -> bool:
-        """Checks if a Drone has direct LoS to its player's 1-row Mother-Node."""
-        target_rows = [0] if drone.player_id == 1 else [GRID_SIZE - 1]
-        
-        for target_y in target_rows:
-            for target_x in range(drone.x - 5, drone.x + 6):
-                if 0 <= target_x < GRID_SIZE:
-                    if self.has_los(drone.x, drone.y, target_x, target_y, drone.player_id):
-                        return True
-        return False
-
-    def check_anchor_connection(self, drone: Drone) -> bool:
-        """Checks if a Drone is powered by any friendly Anchor's directional beam."""
-        for anchor in self.anchors.values():
-            if anchor.player_id == drone.player_id:
-                # Anchors only shoot a beam in ONE orthogonal direction
-                dist = max(abs(drone.x - anchor.x), abs(drone.y - anchor.y))
-                
-                if 0 < dist <= 5:
-                    # Calculate where the Drone should be if it's perfectly in the beam
-                    expected_x = anchor.x + (anchor.direction.value[0] * dist)
-                    expected_y = anchor.y + (anchor.direction.value[1] * dist)
-                    
-                    if drone.x == expected_x and drone.y == expected_y:
-                        # It is in the beam! Now check if the beam is obstructed.
-                        if self.has_los(anchor.x, anchor.y, drone.x, drone.y, drone.player_id):
-                            return True
-        return False
-
-    def resolve_power_network(self, update_batteries: bool = True):
-        """
-        The Engine Heartbeat for Power:
-        Recalculates the entire tether grid using Breadth-First Search (BFS).
-        If update_batteries is False, only updates is_powered status without draining/recharging batteries.
-        """
-        powered_drone_ids = set()
-        
-        # STEP 1: Find all Drones receiving direct "Root" power (Mother-Node or Anchor)
-        for drone in self.drones.values():
-            if self.check_mother_node_connection(drone) or self.check_anchor_connection(drone):
-                powered_drone_ids.add(drone.drone_id)
-                
-        # STEP 2: Propagate power down the line (The Spider Web)
-        # Using a list as a queue to pass power from connected drones to disconnected ones
-        queue = list(powered_drone_ids)
-        
-        while queue:
-            current_id = queue.pop(0)
-            current_drone = self.drones[current_id]
-            
-            # Check all other friendly drones to see if this powered drone can plug them in
-            for other_drone in self.drones.values():
-                if other_drone.player_id == current_drone.player_id and other_drone.drone_id not in powered_drone_ids:
-                    if self.has_los(current_drone.x, current_drone.y, other_drone.x, other_drone.y, current_drone.player_id):
-                        powered_drone_ids.add(other_drone.drone_id)
-                        queue.append(other_drone.drone_id)
-                        
-        # STEP 3: Apply the results to the Batteries
-        for drone in self.drones.values():
-            if drone.drone_id in powered_drone_ids:
-                drone.is_powered = True
-                if update_batteries:
-                    drone.recharge() # Tops off the battery up to 3 and removes inert status
-                else:
-                    drone.is_inert = False
-            else:
-                drone.is_powered = False
-                if update_batteries:
-                    drone.tick_battery() # Subtracts 1 from battery. If 0, becomes inert.
-
-    def is_valid_cell(self, x: int, y: int) -> bool:
-        """Helper to check if coordinates are within the 50x50 grid."""
+    @staticmethod
+    def in_bounds(x: int, y: int) -> bool:
         return 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE
 
-    def process_player_actions(self, player_id: int, commands: List[Dict]):
-        """
-        Executes a player's array of commands strictly in order.
-        Example cmd: {"drone_id": 5, "action": "PUSH", "direction": Direction.UP}
-        """
-        # FIX: Track which drones have already acted this turn to prevent multi-action cheating
-        processed_drones = set()
-        
-        for cmd in commands:
-            drone_id = cmd.get("drone_id")
-            
-            # Enforce strict limit: 1 action per drone per turn
-            if drone_id in processed_drones:
-                continue
-                
-            drone = self.drones.get(drone_id)
-            
-            # Validation: Drone must exist, belong to player, and NOT be inert.
-            if not drone or drone.player_id != player_id or drone.is_inert:
-                continue
-                
-            # Mark this drone as having used its action for this turn
-            processed_drones.add(drone_id)
-            
-            action = cmd.get("action")
-            
-            # ---------------------------------------------------------
-            # 1. MOVE
-            # ---------------------------------------------------------
-            if action == "MOVE":
-                d_dir = Direction[cmd.get("direction")]
-                nx, ny = drone.x + d_dir.value[0], drone.y + d_dir.value[1]
-                
-                # Check bounds, walls, and check if cell is occupied by ANY entity
-                if self.is_valid_cell(nx, ny) and self.walls_grid[ny][nx] == 0:
-                    # Mother-Node rows are impassable (y=0 for P1, y=49 for P2)
-                    if ny not in [0, GRID_SIZE - 1]: 
-                        if self.get_entity_at(nx, ny) is None:
-                            drone.x, drone.y = nx, ny
+    @staticmethod
+    def is_mother_row(y: int) -> bool:
+        return y == 0 or y == GRID_SIZE - 1
 
-            # ---------------------------------------------------------
-            # 2. PUSH
-            # ---------------------------------------------------------
-            elif action == "PUSH":
-                d_dir = Direction[cmd.get("direction")]
-                tx, ty = drone.x + d_dir.value[0], drone.y + d_dir.value[1]
-                target_entity = self.get_entity_at(tx, ty)
-                
-                # We can only push Drones (Anchors are immune)
-                if isinstance(target_entity, Drone):
-                    push_x, push_y = target_entity.x + d_dir.value[0], target_entity.y + d_dir.value[1]
-                    
-                    # 1. Did we push them off the edge of the map completely?
-                    if not self.is_valid_cell(push_x, push_y):
-                        del self.drones[target_entity.drone_id]
-                    else:
-                        # 2. Are they being crushed into a wall or a Mother-Node row?
-                        if self.walls_grid[push_y][push_x] == 1 or push_y in [0, GRID_SIZE - 1]:
-                            del self.drones[target_entity.drone_id]  # BOOM. No inert check needed.
-                        else:
-                            # 3. Space is safe and empty, just slide them over.
-                            if self.get_entity_at(push_x, push_y) is None:
-                                target_entity.x, target_entity.y = push_x, push_y
+    def is_solid(self, x: int, y: int) -> bool:
+        """Cells that never move: map edge, Mother-Node rows, walls, anchors."""
+        if not self.in_bounds(x, y) or self.is_mother_row(y) or (x, y) in self.walls:
+            return True
+        return isinstance(self.occupant.get((x, y)), Anchor)
 
-            # ---------------------------------------------------------
-            # 3. INTERACT (Hacking)
-            # ---------------------------------------------------------
-            elif action == "INTERACT":
-                on_terminal = any(t.x == drone.x and t.y == drone.y for t in self.terminals)
-                if on_terminal:
-                    target_x, target_y = cmd.get("target_x"), cmd.get("target_y")
-                    new_belt_dir = cmd.get("belt_dir") 
-                    if new_belt_dir == "NONE": 
-                        new_belt_dir = None
+    def is_free(self, x: int, y: int) -> bool:
+        return not self.is_solid(x, y) and (x, y) not in self.occupant
 
-                    if self.is_valid_cell(target_x, target_y):
-                        # Cannot place belts on Mother-Nodes, Walls, or under Anchors
-                        if target_y not in [0, GRID_SIZE - 1] and self.walls_grid[target_y][target_x] == 0:
-                            if not isinstance(self.get_entity_at(target_x, target_y), Anchor):
-                                self.conveyor_grid[target_y][target_x] = new_belt_dir
+    def get_entity_at(self, x: int, y: int):
+        return self.occupant.get((x, y))
 
-            # ---------------------------------------------------------
-            # 4. BUILD (Anchor)
-            # ---------------------------------------------------------
-            elif action == "BUILD":
-                # Engine needs the IDs of the 2 other adjacent drones being sacrificed
-                sacrifices = cmd.get("sacrifice_ids", [])
-                facing_dir = Direction[cmd.get("direction")]
-                
-                if len(sacrifices) == 2:
-                    d1 = self.drones.get(sacrifices[0])
-                    d2 = self.drones.get(sacrifices[1])
-                    
-                    if d1 and d2 and d1.is_powered and d2.is_powered:
-                        # Ensure both sacrifices belong to the player and are adjacent to the builder
-                        d1_adj = max(abs(d1.x - drone.x), abs(d1.y - drone.y)) == 1
-                        d2_adj = max(abs(d2.x - drone.x), abs(d2.y - drone.y)) == 1
-                        
-                        if d1_adj and d2_adj and d1.player_id == player_id and d2.player_id == player_id:
-                            # Construct the Anchor!
-                            new_anchor = Anchor(
-                                anchor_id=len(self.anchors) + 1,
-                                player_id=player_id, x=drone.x, y=drone.y, direction=facing_dir
-                            )
-                            self.anchors[new_anchor.anchor_id] = new_anchor
-                            # Remove all 3 drones
-                            self.drones.pop(drone.drone_id, None)
-                            self.drones.pop(d1.drone_id, None)
-                            self.drones.pop(d2.drone_id, None)
+    def terminal_at(self, x: int, y: int) -> Optional[Terminal]:
+        for t in self.terminals:
+            if t.x == x and t.y == y:
+                return t
+        return None
 
-            # ---------------------------------------------------------
-            # 5. SABOTAGE_ANCHOR
-            # ---------------------------------------------------------
-            elif action == "SABOTAGE_ANCHOR":
-                target_anchor = self.anchors.get(cmd.get("anchor_id"))
-                if target_anchor and target_anchor.player_id != player_id:
-                    # Check if Drone is inside the 5x5 defense region (Chebyshev dist <= 2)
-                    dist = max(abs(drone.x - target_anchor.x), abs(drone.y - target_anchor.y))
-                    if dist <= 2:
-                        target_anchor.hp -= 1
-                        del self.drones[drone.drone_id] # Sacrifice the drone
-                        
-                        if target_anchor.hp <= 0:
-                            del self.anchors[target_anchor.anchor_id]
+    def player_drones(self, player_id: int) -> List[Drone]:
+        return [d for d in self.drones.values() if d.player_id == player_id]
 
-    def get_random_empty_cell(self, y_min=None, y_max=None) -> Tuple[int, int]:
-        """Finds a random valid tile strictly within given row bounds."""
-        min_y = y_min if y_min is not None else int(GRID_SIZE * 0.20)
-        max_y = y_max if y_max is not None else int(GRID_SIZE * 0.80)
-        
-        while True:
-            x = random.randint(0, GRID_SIZE - 1)
-            y = random.randint(min_y, max_y)
-            
-            if self.walls_grid[y][x] == 0 and self.get_entity_at(x, y) is None:
-                if not any(t.x == x and t.y == y for t in self.terminals):
-                    return x, y
+    # -----------------------------------------------------------------------
+    # Unit placement helpers (keep the occupancy index in sync)
+    # -----------------------------------------------------------------------
+    def add_drone(self, player_id: int, x: int, y: int) -> Optional[Drone]:
+        if not self.is_free(x, y):
+            return None
+        drone = Drone(self.next_drone_id, player_id, x, y)
+        self.next_drone_id += 1
+        self.drones[drone.drone_id] = drone
+        self.occupant[(x, y)] = drone
+        return drone
 
-    def shift_anima_storms(self):
-        """Drifts ALL 10 Anima Storms while keeping them between rows 20 and 80."""
-        min_y = int(GRID_SIZE * 0.20)
-        max_y = int(GRID_SIZE * 0.80)
-        
-        for storm in self.storms:
-            dx, dy = random.choice([(0,1), (0,-1), (1,0), (-1,0), (1,1), (-1,-1), (-1,1), (1,-1), (0,0)])
-            new_x = max(1, min(GRID_SIZE - 2, storm.x + dx))
-            new_y = max(min_y, min(max_y, storm.y + dy))
-            storm.x, storm.y = new_x, new_y
+    def add_anchor(self, player_id: int, x: int, y: int, direction: Direction) -> Optional[Anchor]:
+        if not self.is_free(x, y):
+            return None
+        anchor = Anchor(self.next_anchor_id, player_id, x, y, direction)
+        self.next_anchor_id += 1
+        self.anchors[anchor.anchor_id] = anchor
+        self.occupant[(x, y)] = anchor
+        return anchor
 
-    def end_of_round_mechanics(self):
-        # 1. MOVE DRONES ON BELTS
-        for drone in list(self.drones.values()):
-            belt_dir = self.conveyor_grid[drone.y][drone.x]
-            if belt_dir:
-                dx, dy = 0, 0
-                if belt_dir == "UP": dy = -1
-                elif belt_dir == "DOWN": dy = 1
-                elif belt_dir == "LEFT": dx = -1
-                elif belt_dir == "RIGHT": dx = 1
-                
-                nx, ny = drone.x + dx, drone.y + dy
-                if 0 < ny < GRID_SIZE - 1 and self.walls_grid[ny][nx] == 0:
-                    if self.get_entity_at(nx, ny) is None:
-                        drone.x, drone.y = nx, ny
+    def _move_drone(self, drone: Drone, x: int, y: int):
+        del self.occupant[(drone.x, drone.y)]
+        drone.x, drone.y = x, y
+        self.occupant[(x, y)] = drone
 
-        # 2. WIPE OLD BELTS EVERY ROUND
-        self.conveyor_grid = [[None for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+    def _remove_drone(self, drone: Drone):
+        self.occupant.pop((drone.x, drone.y), None)
+        self.drones.pop(drone.drone_id, None)
 
-        # 3. SPAWN 2 NEW BELTS
-        for _ in range(2):
-            if self.drones:
-                rd = random.choice(list(self.drones.values()))
-                bx, by = rd.x + random.randint(-3, 3), rd.y + random.randint(-3, 3)
-                if 0 < by < GRID_SIZE - 1 and 0 <= bx < GRID_SIZE and self.walls_grid[by][bx] == 0:
-                    if not any(t.x == bx and t.y == by for t in self.terminals) and self.get_entity_at(bx, by) is None:
-                        self.conveyor_grid[by][bx] = random.choice(["UP", "DOWN", "LEFT", "RIGHT"])
+    def _destroy_drone(self, drone: Drone, cause: str, by_player: Optional[int] = None):
+        self._remove_drone(drone)
+        self.stats[drone.player_id]["drones_lost"] += 1
+        if by_player is not None and by_player != drone.player_id:
+            self.stats[by_player]["crushed_enemies"] += 1
+        self.events.append({"type": "crushed", "drone": drone.drone_id, "player": drone.player_id,
+                            "x": drone.x, "y": drone.y, "cause": cause})
 
-        # 4. TERMINALS & STORMS
-        for i, terminal in enumerate(self.terminals):
-            terminal.timer -= 1
-            if terminal.timer <= 0:
-                terminal.timer = TERMINAL_LIFESPAN
-                tx, ty = self.get_random_empty_cell(10, 40)
-                terminal.x, terminal.y = tx, ty
-                
-        if self.round > 0 and self.round % 25 == 0:
-            self.storms = self._place_storms()
+    # -----------------------------------------------------------------------
+    # Line of sight & the power network
+    # -----------------------------------------------------------------------
+    def blocks_los(self, x: int, y: int, player_id: int) -> bool:
+        """Walls block everyone. Enemy units (drones in any state, anchors) block you."""
+        if (x, y) in self.walls:
+            return True
+        unit = self.occupant.get((x, y))
+        return unit is not None and unit.player_id != player_id
 
-    def record_frame(self):
-        """Called at the end of every round to snapshot the board."""
-        frame = {
-            "round": self.round,
+    def has_los(self, x1: int, y1: int, x2: int, y2: int, player_id: int) -> bool:
+        """Straight (orthogonal / diagonal) unobstructed line of length 1..TETHER_RANGE."""
+        dx, dy = x2 - x1, y2 - y1
+        dist = max(abs(dx), abs(dy))
+        if dist == 0 or dist > TETHER_RANGE:
+            return False
+        if dx != 0 and dy != 0 and abs(dx) != abs(dy):
+            return False
+        sx = (dx > 0) - (dx < 0)
+        sy = (dy > 0) - (dy < 0)
+        for step in range(1, dist):
+            if self.blocks_los(x1 + sx * step, y1 + sy * step, player_id):
+                return False
+        return True
+
+    def mother_link(self, x: int, y: int, player_id: int) -> Optional[Tuple[int, int]]:
+        """Mother-Node cell a unit at (x, y) can draw power from, if any."""
+        row = MOTHER_ROW[player_id]
+        gap = abs(row - y)
+        if gap == 0 or gap > TETHER_RANGE:
+            return None
+        for tx in (x, x - gap, x + gap):        # straight down/up, or the two diagonals
+            if 0 <= tx < GRID_SIZE and self.has_los(x, y, tx, row, player_id):
+                return (tx, row)
+        return None
+
+    def beam_cells(self, anchor: Anchor) -> List[Tuple[int, int]]:
+        """Cells lit by an anchor's beam; the beam stops at walls and enemy units."""
+        cells = []
+        for step in range(1, ANCHOR_BEAM_RANGE + 1):
+            cx = anchor.x + anchor.direction.dx * step
+            cy = anchor.y + anchor.direction.dy * step
+            if not self.in_bounds(cx, cy) or self.blocks_los(cx, cy, anchor.player_id):
+                break
+            cells.append((cx, cy))
+        return cells
+
+    def recompute_power(self):
+        """BFS over each player's tether network. Sets is_powered and power_source."""
+        for player_id in (1, 2):
+            drones = self.player_drones(player_id)
+            powered = set()
+            queue = deque()
+
+            def power(drone: Drone, source: Tuple[int, int]):
+                drone.power_source = source
+                powered.add(drone.drone_id)
+                queue.append(drone)
+
+            # Roots: the Mother-Node row and friendly anchor beams
+            for drone in drones:
+                link = self.mother_link(drone.x, drone.y, player_id)
+                if link is not None:
+                    power(drone, link)
+            for anchor in self.anchors.values():
+                if anchor.player_id != player_id:
+                    continue
+                for cell in self.beam_cells(anchor):
+                    unit = self.occupant.get(cell)
+                    if isinstance(unit, Drone) and unit.player_id == player_id \
+                            and unit.drone_id not in powered:
+                        power(unit, (anchor.x, anchor.y))
+
+            # Spread: any connected drone powers every friendly drone it can see
+            while queue:
+                current = queue.popleft()
+                for other in drones:
+                    if other.drone_id in powered:
+                        continue
+                    if self.has_los(current.x, current.y, other.x, other.y, player_id):
+                        power(other, (current.x, current.y))
+
+            for drone in drones:
+                drone.is_powered = drone.drone_id in powered
+                if not drone.is_powered:
+                    drone.power_source = None
+
+    def _tick_batteries(self):
+        for drone in self.drones.values():
+            if drone.is_powered:
+                drone.battery = min(MAX_BATTERY, drone.battery + 1)
+            else:
+                drone.battery = max(0, drone.battery - 1)
+
+    # -----------------------------------------------------------------------
+    # Vision / fog of war
+    # -----------------------------------------------------------------------
+    def vision(self, player_id: int) -> set:
+        """5x5 around every active drone and every anchor of the player."""
+        centres = [(d.x, d.y) for d in self.drones.values()
+                   if d.player_id == player_id and d.is_active]
+        centres += [(a.x, a.y) for a in self.anchors.values() if a.player_id == player_id]
+        seen = set()
+        r = VISION_RADIUS
+        for cx, cy in centres:
+            for y in range(max(0, cy - r), min(GRID_SIZE, cy + r + 1)):
+                for x in range(max(0, cx - r), min(GRID_SIZE, cx + r + 1)):
+                    seen.add((x, y))
+        return seen
+
+    def generate_player_payload(self, player_id: int, visible: Optional[set] = None) -> dict:
+        if visible is None:
+            visible = self.vision(player_id)
+        enemy = 3 - player_id
+
+        my_drones = [{"id": d.drone_id, "x": d.x, "y": d.y, "battery": d.battery,
+                      "is_powered": d.is_powered, "is_inert": d.is_inert}
+                     for d in sorted(self.player_drones(player_id), key=lambda d: d.drone_id)]
+        my_anchors = [{"id": a.anchor_id, "x": a.x, "y": a.y, "direction": a.direction.name,
+                       "hp": a.hp}
+                      for a in self.anchors.values() if a.player_id == player_id]
+        enemy_drones = [{"id": d.drone_id, "x": d.x, "y": d.y, "is_inert": d.is_inert}
+                        for d in self.drones.values()
+                        if d.player_id == enemy and (d.x, d.y) in visible]
+        enemy_anchors = [{"id": a.anchor_id, "x": a.x, "y": a.y, "direction": a.direction.name,
+                          "hp": a.hp}
+                         for a in self.anchors.values()
+                         if a.player_id == enemy and (a.x, a.y) in visible]
+        terminals = [{"id": t.terminal_id, "x": t.x, "y": t.y, "turns_left": t.timer}
+                     for t in self.terminals if (t.x, t.y) in visible]
+        belts = [{"x": x, "y": y, "dir": d.name} for (x, y), d in sorted(self.belts.items())
+                 if (x, y) in visible]
+        storms = [{"x": s.x, "y": s.y, "multiplier": s.multiplier, "turns_left": s.timer}
+                  for s in self.storms if any(c in visible for c in s.cells())]
+
+        return {
+            "type": "turn",
             "turn": self.turn,
-            "active_player": self.current_player,
-            "scores": {"1": self.scores[1], "2": self.scores[2]},
-            "drones": [],
-            "anchors": [],
-            "terminals": [],
-            "belts": [{"x": x, "y": y, "dir": self.conveyor_grid[y][x]} 
-                      for y in range(GRID_SIZE) for x in range(GRID_SIZE) if self.conveyor_grid[y][x]],
-            "storms": [{"x": s.x, "y": s.y, "multiplier": s.multiplier} for s in self.storms]
-        }
-        
-        # 1. Snapshot Drones
-        for drone in self.drones.values():
-            frame["drones"].append({
-                "id": drone.drone_id,
-                "p": drone.player_id,
-                "x": drone.x, 
-                "y": drone.y,
-                "pow": drone.is_powered,
-                "inert": drone.is_inert
-            })
-            
-        # 2. Snapshot Anchors
-        for anchor in self.anchors.values():
-            frame["anchors"].append({
-                "id": anchor.anchor_id,
-                "p": anchor.player_id,
-                "x": anchor.x,
-                "y": anchor.y,
-                "dir": anchor.direction.name,
-                "hp": anchor.hp
-            })
-            
-        # 3. Snapshot Terminals
-        for terminal in self.terminals:
-            frame["terminals"].append({
-                "id": terminal.terminal_id,
-                "x": terminal.x, 
-                "y": terminal.y
-            })
-                    
-        self.replay_data["frames"].append(frame)
-
-    def export_replay(self, filename: str):
-        """Saves the recorded frames and grid config to a JSON file for the visualizer."""
-        with open(filename, 'w') as f:
-            json.dump(self.replay_data, f)
-    
-    def generate_player_payload(self, player_id: int) -> dict:
-        """
-        Calculates Fog of War and generates the JSON payload for the current player.
-        Only data within a 5x5 radius of POWERED friendly drones is included.
-        """
-        visible_coords = set()
-        my_drones = []
-        my_anchors = []
-        
-        # 1. GATHER MY ENTITIES & CALCULATE VISION
-        for drone in self.drones.values():
-            if drone.player_id == player_id:
-                my_drones.append({
-                    "id": drone.drone_id, "x": drone.x, "y": drone.y,
-                    "battery": drone.battery, "is_powered": drone.is_powered, "is_inert": drone.is_inert
-                })
-                # Only powered drones grant vision (5x5 grid centered on the drone)
-                if drone.is_powered:
-                    for dy in range(-2, 3):
-                        for dx in range(-2, 3):
-                            vx, vy = drone.x + dx, drone.y + dy
-                            if self.is_valid_cell(vx, vy):
-                                visible_coords.add((vx, vy))
-
-        for anchor in self.anchors.values():
-            if anchor.player_id == player_id:
-                my_anchors.append({
-                    "id": anchor.anchor_id, "x": anchor.x, "y": anchor.y,
-                    "direction": anchor.direction.name, "hp": anchor.hp
-                })
-
-        # 2. MASK THE ENVIRONMENT (Enemies, Terrain, Terminals)
-        visible_enemy_drones = []
-        visible_enemy_anchors = []
-        visible_terminals = []
-        visible_terrain = []
-        
-        # Check all enemies to see if they fall inside our vision coords
-        for drone in self.drones.values():
-            if drone.player_id != player_id and (drone.x, drone.y) in visible_coords:
-                visible_enemy_drones.append({
-                    "id": drone.drone_id, "x": drone.x, "y": drone.y, "is_inert": drone.is_inert
-                }) # Notice we don't tell the player the exact battery level of enemies!
-                
-        for anchor in self.anchors.values():
-            if anchor.player_id != player_id and (anchor.x, anchor.y) in visible_coords:
-                visible_enemy_anchors.append({
-                    "id": anchor.anchor_id, "x": anchor.x, "y": anchor.y, 
-                    "direction": anchor.direction.name, "hp": anchor.hp
-                })
-
-        for terminal in self.terminals:
-            if (terminal.x, terminal.y) in visible_coords:
-                visible_terminals.append({
-                    "id": terminal.terminal_id, "x": terminal.x, "y": terminal.y, "timer": terminal.timer
-                })
-
-        # To keep JSON fast, we only send terrain data if it is a Wall or a Conveyor Belt.
-        # If a coordinate isn't in this list, the bot can assume it's an empty floor.
-        for (vx, vy) in visible_coords:
-            is_wall = self.walls_grid[vy][vx] == 1
-            belt = self.conveyor_grid[vy][vx]
-            if is_wall or belt is not None:
-                visible_terrain.append({
-                    "x": vx, "y": vy, 
-                    "is_wall": is_wall, 
-                    "belt_dir": belt if belt is not None else "NONE"
-                })
-
-        # 3. MASK THE ANIMA STORMS
-        visible_storms = []
-        for storm in self.storms:
-            storm_coords = [(sx, sy) for sx in range(storm.x - 1, storm.x + 2) 
-                                     for sy in range(storm.y - 1, storm.y + 2)]
-            if any(sc in visible_coords for sc in storm_coords):
-                visible_storms.append({"x": storm.x, "y": storm.y, "multiplier": storm.multiplier})
-
-        # 4. PACKAGE THE FINAL PAYLOAD
-        payload = {
-            "turn": self.turn,
+            "max_turns": self.max_turns,
+            "player_id": player_id,
             "my_score": self.scores[player_id],
-            "enemy_score": self.scores[2 if player_id == 1 else 1],
+            "enemy_score": self.scores[enemy],
             "my_drones": my_drones,
             "my_anchors": my_anchors,
-            "visible_enemy_drones": visible_enemy_drones,
-            "visible_enemy_anchors": visible_enemy_anchors,
-            "visible_terminals": visible_terminals,
-            "visible_terrain": visible_terrain,
-            "visible_storms": visible_storms
+            "my_reserve": self.reserve[player_id],
+            "visible_enemy_drones": enemy_drones,
+            "visible_enemy_anchors": enemy_anchors,
+            "visible_terminals": terminals,
+            "visible_belts": belts,
+            "visible_storms": storms,
+            "feedback": list(self.feedback[player_id]),
         }
-        
+
+    def init_message(self, player_id: int) -> dict:
+        """Sent once before the first turn: everything static about the match."""
+        return {
+            "type": "init",
+            "player_id": player_id,
+            "grid_size": GRID_SIZE,
+            "max_turns": self.max_turns,
+            "my_mother_row": MOTHER_ROW[player_id],
+            "enemy_mother_row": MOTHER_ROW[3 - player_id],
+            "walls": [[x, y] for (x, y) in sorted(self.walls)],
+            "rules": {
+                "max_battery": MAX_BATTERY, "tether_range": TETHER_RANGE,
+                "vision_radius": VISION_RADIUS, "anchor_hp": ANCHOR_HP,
+                "anchor_beam_range": ANCHOR_BEAM_RANGE, "sabotage_radius": SABOTAGE_RADIUS,
+                "terminal_lifespan": list(TERMINAL_LIFESPAN), "drones_per_player": DRONES_PER_PLAYER,
+                "storm_rows": list(STORM_ROWS), "spawns_per_turn": SPAWNS_PER_TURN,
+                "crush_active_drones": CRUSH_ACTIVE_DRONES,
+            },
+        }
+
+    # -----------------------------------------------------------------------
+    # Turn pipeline
+    # -----------------------------------------------------------------------
+    def begin_turn(self) -> dict:
+        """Active player power and vision computed, then that player gets its payload."""
+        if self.turn_started:
+            raise RuntimeError("begin_turn() called twice without end_turn()")
+        player_id = self.current_player
+        self.events = []
+        self.recompute_power()
+        self.turn_vision = self.vision(player_id)
+        self.can_act = {d.drone_id for d in self.player_drones(player_id) if d.is_active}
+        self.acted = set()
+        self.spawned_this_turn = 0
+        self.turn_started = True
+        payload = self.generate_player_payload(player_id, self.turn_vision)
+        self.feedback[player_id] = []
         return payload
 
-# ... [End of your GameState class and export_replay method] ...
+    def apply_commands(self, commands) -> List[str]:
+        """Runs a whole command array (in order). Returns the rejection messages."""
+        player_id = self.current_player
+        if isinstance(commands, dict) and isinstance(commands.get("commands"), list):
+            commands = commands["commands"]
+        if not isinstance(commands, list):
+            self._reject(player_id, "response must be a JSON array of commands")
+            return list(self.feedback[player_id])
+        if len(commands) > MAX_COMMANDS:
+            self._reject(player_id, f"only the first {MAX_COMMANDS} commands are read")
+        for cmd in commands[:MAX_COMMANDS]:
+            self.execute_command(cmd)
+        return list(self.feedback[player_id])
 
-# Global dictionary to hold the persistent bot processes
-bot_processes = {}
-bot_errors = {}
+    def end_turn(self):
+        """Conveyor belts push standing drones, power/batteries/scores/world tick, frame recorded."""
+        if not self.turn_started:
+            raise RuntimeError("end_turn() called before begin_turn()")
+        self._belt_phase()
+        self.recompute_power()
+        self._tick_batteries()                     # every turn, both players' drones
+        self._score(1)                              # both players score every turn
+        self._score(2)
+        self._tick_world()
+        self.record_frame()
+        self.turn += 1
+        self.turn_started = False
 
-def start_bot(player_id: int, launch_command: list):
-    """Spawns a persistent background process for a bot."""
-    if launch_command:
-        # Verify script existence before attempting to execute
-        for arg in launch_command:
-            if arg.endswith('.py') and not os.path.exists(arg):
-                print(f"[ERROR] Could not find bot script: '{arg}'")
-                print("Verify 'Dummy_Bot.py' is in the same directory as 'Game_Engine.py'.")
-                return
+    def play_turn(self, commands) -> List[str]:
+        """Convenience for tests / scripts that already know their commands."""
+        self.begin_turn()
+        rejected = self.apply_commands(commands)
+        self.end_turn()
+        return rejected
 
-        bot_processes[player_id] = subprocess.Popen(
-            launch_command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
+    # -----------------------------------------------------------------------
+    # Commands
+    # -----------------------------------------------------------------------
+    def _reject(self, player_id: int, message: str):
+        if len(self.feedback[player_id]) < MAX_FEEDBACK:
+            self.feedback[player_id].append(f"turn {self.turn}: {message}")
 
-def get_commands_from_bot(player_id: int, payload: dict) -> list:
-    """Sends the Fog of War payload to the bot and reads the JSON response."""
-    process = bot_processes.get(player_id)
-    
-    if not process:
-        return []
-        
-    # If process has already exited in a previous turn, return empty without re-printing
-    if player_id in bot_errors:
-        return []
+    def execute_command(self, cmd) -> Tuple[bool, str]:
+        """Executes one command for the active player. Returns (accepted, message)."""
+        player_id = self.current_player
+        if not self.turn_started:
+            return False, "no turn in progress"
 
-    # Check if process crashed or exited
-    if process.poll() is not None:
-        _, err = process.communicate()
-        bot_errors[player_id] = err
-        print(f"\n[CRITICAL] Player {player_id} Bot process exited early!")
-        if err and err.strip():
-            print(f"Error log:\n{err.strip()}\n")
-        return []
+        def reject(message: str) -> Tuple[bool, str]:
+            self._reject(player_id, message)
+            return False, message
 
-    try:
-        # 1. Send data to the bot
-        process.stdin.write(json.dumps(payload) + "\n")
-        process.stdin.flush()
-        
-        # 2. Read the bot's response
-        response_str = process.stdout.readline()
-        
-        # 3. Parse the JSON command array
-        if response_str and response_str.strip():
-            return json.loads(response_str)
-        return []
-        
-    except Exception as e:
-        if process.poll() is not None and player_id not in bot_errors:
-            _, err = process.communicate()
-            bot_errors[player_id] = err
-            print(f"\n[CRITICAL] Player {player_id} Bot crashed during turn execution!")
-            if err and err.strip():
-                print(f"Error log:\n{err.strip()}\n")
+        if not isinstance(cmd, dict):
+            return reject(f"command {cmd!r} is not an object")
+        if str(cmd.get("action", "")).upper() == "SPAWN":
+            message = self._do_spawn(player_id, cmd)
+            return (True, "spawn") if message is None else reject(f"SPAWN: {message}")
+        drone_id = cmd.get("drone_id")
+        drone = self.drones.get(drone_id) if is_int(drone_id) else None
+        if drone is None or drone.player_id != player_id:
+            return reject(f"drone {drone_id!r} is not one of your drones")
+        if drone_id in self.acted:
+            return reject(f"drone {drone_id} already acted this turn")
+        if drone_id not in self.can_act:
+            return reject(f"drone {drone_id} is inert and cannot act")
+        self.acted.add(drone_id)
+
+        action = str(cmd.get("action", "")).upper()
+        if action == "WAIT":
+            return True, "wait"
+        if action == "MOVE":
+            message = self._do_move(drone, cmd)
+        elif action == "PUSH":
+            message = self._do_push(drone, cmd)
+        elif action == "INTERACT":
+            message = self._do_interact(drone, cmd)
+        elif action == "BUILD":
+            message = self._do_build(drone, cmd)
+        elif action == "SABOTAGE_ANCHOR":
+            message = self._do_sabotage(drone, cmd)
         else:
-            print(f"Error communicating with Player {player_id} Bot: {e}")
-        return []
+            message = f"unknown action {cmd.get('action')!r}"
+            return reject(f"drone {drone_id}: {message}")
 
-def play_match(p1_cmd="", p2_cmd="", custom_drones: Optional[List[Dict]] = None):
-    game = GameState()
-    
-    # Boot up the bot processes
-    start_bot(1, p1_cmd)
-    start_bot(2, p2_cmd)
-    
-    # ---------------------------------------------------------
-    # 1. MAP GENERATOR & INITIAL SPAWNS
-    # ---------------------------------------------------------
-    game.walls_grid = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-    
-    # A. Scaled Symmetrical Walls (20 pairs = 40 walls)
-    walls_placed = 0
-    while walls_placed < 20: 
-        wx = random.randint(0, GRID_SIZE - 1)
-        wy = random.randint(2, (GRID_SIZE // 2) - 1)
-        if 15 <= wx <= 35 and 15 <= wy <= 35: # Keep center clear
-            continue
-        game.walls_grid[wy][wx] = 1
-        game.walls_grid[GRID_SIZE - 1 - wy][GRID_SIZE - 1 - wx] = 1
-        walls_placed += 1
+        if message is None:
+            return True, action.lower()
+        return reject(f"drone {drone_id} {action}: {message}")
 
-    # B. Spawn 10 Terminals 
-    for i in range(10): 
-        tx, ty = game.get_random_empty_cell(10, 40)
-        game.terminals.append(Terminal(terminal_id=i, x=tx, y=ty))
+    # Each _do_* returns None on success or a short reason on failure.
+    def spawn_link(self, x: int, y: int, player_id: int) -> Optional[Tuple[int, int]]:
+        """Power source a new drone at (x, y) would draw from right now, if any."""
+        link = self.mother_link(x, y, player_id)
+        if link is not None:
+            return link
+        for anchor in self.anchors.values():
+            if anchor.player_id == player_id and (x, y) in self.beam_cells(anchor):
+                return (anchor.x, anchor.y)
+        for d in self.drones.values():
+            if d.player_id == player_id and d.is_powered and self.has_los(d.x, d.y, x, y, player_id):
+                return (d.x, d.y)
+        return None
 
-    # C. Spawn Drones (Custom chosen squares or default 25 per player)
-    drone_counter = 1
-    if custom_drones:
-        for cd in custom_drones:
-            pid = cd.get("player_id", 1)
-            cx, cy = cd.get("x"), cd.get("y")
-            if game.is_valid_cell(cx, cy) and cy not in [0, GRID_SIZE - 1] and game.walls_grid[cy][cx] == 0:
-                if game.get_entity_at(cx, cy) is None:
-                    game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=pid, x=cx, y=cy)
-                    drone_counter += 1
-    else:
-        # Default: 25 Drones per player (P1 on row 1, P2 on row 48)
-        p1_occupied_x = set()
-        p2_occupied_x = set()
-        for i in range(25):
-            x1 = random.randint(0, GRID_SIZE - 1)
-            while x1 in p1_occupied_x:
-                x1 = random.randint(0, GRID_SIZE - 1)
-            p1_occupied_x.add(x1)
-            game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=1, x=x1, y=1)
-            drone_counter += 1
+    def _do_spawn(self, player_id: int, cmd: dict) -> Optional[str]:
+        x, y = cmd.get("x"), cmd.get("y")
+        if not is_int(x) or not is_int(y) or not self.in_bounds(x, y):
+            return "x / y must be on the board"
+        if self.reserve[player_id] <= 0:
+            return "no drones left in reserve"
+        if self.spawned_this_turn >= SPAWNS_PER_TURN:
+            return f"only {SPAWNS_PER_TURN} spawns per turn"
+        if not self.is_free(x, y):
+            return f"cell ({x},{y}) is not empty"
+        source = self.spawn_link(x, y, player_id)
+        if source is None:
+            return f"cell ({x},{y}) is not linked to your powered network"
+        drone = self.add_drone(player_id, x, y)
+        drone.is_powered, drone.power_source = True, source   # can relay later spawns this turn
+        self.reserve[player_id] -= 1
+        self.spawned_this_turn += 1
+        self.acted.add(drone.drone_id)                        # it acts from next turn on
+        self.events.append({"type": "spawn", "player": player_id, "drone": drone.drone_id,
+                            "x": x, "y": y})
+        return None
 
-            x2 = random.randint(0, GRID_SIZE - 1)
-            while x2 in p2_occupied_x:
-                x2 = random.randint(0, GRID_SIZE - 1)
-            p2_occupied_x.add(x2)
-            game.drones[drone_counter] = Drone(drone_id=drone_counter, player_id=2, x=x2, y=GRID_SIZE - 2)
-            drone_counter += 1
+    def _do_move(self, drone: Drone, cmd: dict) -> Optional[str]:
+        direction = parse_direction(cmd.get("direction"))
+        if direction is None:
+            return f"bad direction {cmd.get('direction')!r}"
+        nx, ny = drone.x + direction.dx, drone.y + direction.dy
+        if self.is_solid(nx, ny):
+            return "blocked by wall / anchor / edge"
+        if (nx, ny) in self.occupant:
+            return "cell occupied by a drone"
+        self._move_drone(drone, nx, ny)
+        return None
 
-    game.resolve_power_network(update_batteries=False)
+    def _do_push(self, drone: Drone, cmd: dict) -> Optional[str]:
+        direction = parse_direction(cmd.get("direction"))
+        if direction is None:
+            return f"bad direction {cmd.get('direction')!r}"
+        tx, ty = drone.x + direction.dx, drone.y + direction.dy
+        target = self.occupant.get((tx, ty))
+        if target is None:
+            return "nothing to push"
+        if isinstance(target, Anchor):
+            return "anchors cannot be pushed"
+        dest_x, dest_y = tx + direction.dx, ty + direction.dy
+        if self.is_solid(dest_x, dest_y):
+            if target.is_inert or CRUSH_ACTIVE_DRONES:
+                self._destroy_drone(target, "push", by_player=drone.player_id)
+                return None
+            return "target is active and the cell behind it is solid"
+        if (dest_x, dest_y) in self.occupant:
+            return "cell behind the target is occupied"
+        self._move_drone(target, dest_x, dest_y)
+        return None
 
-    game.resolve_power_network()
-    
-    # ---------------------------------------------------------
-        
-    game.initialize_replay()
-    # Record Frame 0: Initial spawn state before any turns are taken
-    game.round = 0
-    game.current_player = 1
-    game.record_frame()
-    
-    # ---------------------------------------------------------
-    # 2. MATCH LOOP (TRUE TURN-BASED EXECUTION)
-    # ---------------------------------------------------------
-    for turn in range(3000):
-        game.turn = turn
-        active_player = 1 if turn % 2 == 0 else 2
-        game.current_player = active_player
-        game.round = (turn // 2) + 1
-        
-        # 1. Ask ONLY the active player for moves
-        payload = game.generate_player_payload(active_player)
-        actions = get_commands_from_bot(active_player, payload)
+    def _do_interact(self, drone: Drone, cmd: dict) -> Optional[str]:
+        if self.terminal_at(drone.x, drone.y) is None:
+            return "drone is not standing on a terminal"
+        tx, ty = cmd.get("target_x"), cmd.get("target_y")
+        if not is_int(tx) or not is_int(ty) or not self.in_bounds(tx, ty):
+            return "target_x / target_y must be on the board"
+        if (tx, ty) not in self.turn_vision:
+            return "target tile is not inside your vision"
+        if self.is_mother_row(ty) or (tx, ty) in self.walls:
+            return "cannot place belts on walls or Mother-Node rows"
+        if isinstance(self.occupant.get((tx, ty)), Anchor):
+            return "cannot place belts under anchors"
+        raw = cmd.get("belt_dir", "NONE")
+        if raw is None or (isinstance(raw, str) and raw.upper() == "NONE"):
+            self.belts.pop((tx, ty), None)
+            self.terminal_belts.pop((tx, ty), None)
+            new_dir = "NONE"
+        else:
+            direction = parse_direction(raw)
+            if direction is None:
+                return f"bad belt_dir {raw!r}"
+            self.belts[(tx, ty)] = direction
+            self.terminal_belts[(tx, ty)] = 2
+            new_dir = direction.name
+        self.stats[drone.player_id]["hacks"] += 1
+        self.events.append({"type": "hack", "player": drone.player_id, "drone": drone.drone_id,
+                            "x": tx, "y": ty, "dir": new_dir})
+        return None
 
-        # 2. Process ONLY the active player's actions
-        game.process_player_actions(active_player, actions)
+    def _do_build(self, drone: Drone, cmd: dict) -> Optional[str]:
+        direction = parse_direction(cmd.get("direction"))
+        if direction is None:
+            return f"bad beam direction {cmd.get('direction')!r}"
+        partner_ids = cmd.get("partners", cmd.get("sacrifice_ids"))
+        if not isinstance(partner_ids, list) or len(partner_ids) != 2 \
+                or not all(is_int(p) for p in partner_ids) \
+                or len(set(partner_ids)) != 2 or drone.drone_id in partner_ids:
+            return "partners must list 2 other drone ids"
+        partners = []
+        for pid in partner_ids:
+            partner = self.drones.get(pid)
+            if partner is None or partner.player_id != drone.player_id:
+                return f"partner {pid!r} is not your drone"
+            if pid not in self.can_act:
+                return f"partner {pid} is inert"
+            if pid in self.acted:
+                return f"partner {pid} already acted this turn"
+            if chebyshev(partner.x, partner.y, drone.x, drone.y) > 5:
+                return f"partner {pid} is more than 5 cells away from the builder"
+            partners.append(partner)
+        # Collinearity check: the two partners and the builder drone must lie on the same
+        # orthogonal or diagonal line through the builder.  That is, the unit direction
+        # vectors from drone → partner[0] and drone → partner[1] must be exact opposites.
+        def unit_dir(ax, ay, bx, by):
+            dx, dy = bx - ax, by - ay
+            if dx == 0 and dy == 0:
+                return (0, 0)
+            g = abs(dx) if dy == 0 else (abs(dy) if dx == 0 else min(abs(dx), abs(dy)))
+            # Only orthogonal / diagonal lines are valid (|dx|==|dy| or one is 0)
+            if dx != 0 and dy != 0 and abs(dx) != abs(dy):
+                return None  # not on a clean diagonal
+            return (dx // g, dy // g)
+        d1, d2 = partners
+        v1 = unit_dir(drone.x, drone.y, d1.x, d1.y)
+        v2 = unit_dir(drone.x, drone.y, d2.x, d2.y)
+        if v1 is None or v2 is None:
+            return "partners must be collinear with the builder on an orthogonal or diagonal line"
+        if v1 != (-v2[0], -v2[1]):
+            return "partners must be on opposite sides of the builder along the same line"
+        if self.terminal_at(drone.x, drone.y) is not None:
+            return "cannot build an anchor on a terminal"
 
-        # 3. Apply board mechanics after BOTH players have gone (every 1 full round = 2 turns)
-        if turn % 2 == 1:
-            game.end_of_round_mechanics()
-            
-        # 4. UNIVERSAL TURN MECHANICS: Resolve power, Score, and Drain Battery for ALL drones
-        game.resolve_power_network(update_batteries=False)
-        
-        for storm in game.storms:
-            sx_min, sx_max = storm.x - 1, storm.x + 1
-            sy_min, sy_max = storm.y - 1, storm.y + 1
-            for drone in game.drones.values():
-                if not drone.is_inert and (sx_min <= drone.x <= sx_max) and (sy_min <= drone.y <= sy_max):
-                    game.scores[drone.player_id] += storm.multiplier
-                    
-        for drone in game.drones.values():
-            if drone.is_powered:
-                drone.recharge()
+        x, y, player_id = drone.x, drone.y, drone.player_id
+        for unit in [drone] + partners:
+            self.acted.add(unit.drone_id)
+            self._remove_drone(unit)
+        anchor = self.add_anchor(player_id, x, y, direction)
+        self.stats[player_id]["anchors_built"] += 1
+        self.events.append({"type": "build", "player": player_id, "anchor": anchor.anchor_id,
+                            "x": x, "y": y, "dir": direction.name,
+                            "sacrificed": [drone.drone_id] + partner_ids})
+        return None
+
+    def _do_sabotage(self, drone: Drone, cmd: dict) -> Optional[str]:
+        anchor_id = cmd.get("anchor_id")
+        anchor = self.anchors.get(anchor_id) if is_int(anchor_id) else None
+        if anchor is None or anchor.player_id == drone.player_id:
+            return f"anchor {anchor_id!r} is not an enemy anchor"
+        if chebyshev(drone.x, drone.y, anchor.x, anchor.y) > SABOTAGE_RADIUS:
+            return "drone is outside the anchor's 5x5 defense region"
+        self._remove_drone(drone)
+        self.stats[drone.player_id]["drones_lost"] += 1
+        anchor.hp -= 1
+        self.events.append({"type": "sabotage", "player": drone.player_id, "drone": drone.drone_id,
+                            "anchor": anchor.anchor_id, "hp_left": anchor.hp})
+        if anchor.hp <= 0:
+            del self.occupant[(anchor.x, anchor.y)]
+            del self.anchors[anchor.anchor_id]
+            self.stats[drone.player_id]["anchors_destroyed"] += 1
+            self.events.append({"type": "anchor_destroyed", "anchor": anchor.anchor_id,
+                                "player": anchor.player_id, "x": anchor.x, "y": anchor.y})
+        return None
+
+    # -----------------------------------------------------------------------
+    # Conveyor belts
+    # -----------------------------------------------------------------------
+    def _belt_phase(self):
+        """
+        Every drone on the board standing on a belt slides 1 cell.
+        All slides are simultaneous: a drone may follow one that moves out of
+        the way, two drones sliding into the same cell both stay put, and an
+        INERT drone dragged into a solid cell is crushed (active ones just stop).
+        """
+        pending = {d.drone_id: self.belts[(d.x, d.y)] for d in self.drones.values()
+                   if (d.x, d.y) in self.belts}
+        while pending:
+            progress = False
+            wanted: Dict[Tuple[int, int], List[int]] = {}
+            for drone_id, direction in pending.items():
+                drone = self.drones[drone_id]
+                wanted.setdefault((drone.x + direction.dx, drone.y + direction.dy), []).append(drone_id)
+            for cell, drone_ids in wanted.items():
+                if len(drone_ids) > 1:                     # head-on contest: nobody moves
+                    for drone_id in drone_ids:
+                        del pending[drone_id]
+                    progress = True
+                    continue
+                drone = self.drones[drone_ids[0]]
+                if self.is_solid(*cell):
+                    if drone.is_inert:
+                        self._destroy_drone(drone, "belt")
+                    del pending[drone.drone_id]
+                    progress = True
+                elif cell in self.occupant:
+                    blocker = self.occupant[cell]
+                    if isinstance(blocker, Drone) and blocker.drone_id in pending:
+                        continue                           # wait: it may slide away first
+                    del pending[drone.drone_id]
+                    progress = True
+                else:
+                    self._move_drone(drone, *cell)
+                    del pending[drone.drone_id]
+                    progress = True
+            if not progress:                               # a closed loop of drones: freeze
+                break
+
+    # -----------------------------------------------------------------------
+    # Scoring and world timers
+    # -----------------------------------------------------------------------
+    def _score(self, player_id: int):
+        gained = 0
+        for storm in self.storms:
+            count = sum(1 for d in self.player_drones(player_id)
+                        if d.is_active and storm.contains(d.x, d.y))
+            gained += count * storm.multiplier
+        self.scores[player_id] += gained
+
+    def _tick_world(self):
+        # Terminals (3 mirrored pairs)
+        for i in range(0, len(self.terminals), 2):
+            pair = self.terminals[i:i + 2]
+            for t in pair:
+                t.timer -= 1
+            if pair[0].timer <= 0:
+                self._relocate_terminal_pair(i)
+
+        # Storms (4 mirrored pairs)
+        for i in range(0, len(self.storms), 2):
+            pair = self.storms[i:i + 2]
+            for s in pair:
+                s.timer -= 1
+            if pair[0].timer <= 0:
+                self._respawn_storm_pair(i)
+
+        # Belt stripes (5 mirrored pairs, 10 stripes)
+        for stripe in self.belt_stripes:
+            stripe.timer -= 1
+            if stripe.timer <= 0:
+                self._relocate_belt_stripe_pair(stripe.pair_id)
+
+        # Terminal-created single-length belts stay for 2 turns and then disappear
+        expired_terminal = []
+        for cell, turns in list(self.terminal_belts.items()):
+            if turns <= 1:
+                expired_terminal.append(cell)
             else:
-                drone.tick_battery()
+                self.terminal_belts[cell] = turns - 1
+        if expired_terminal:
+            stripe_cells = {c for s in self.belt_stripes for c in s.cells + s.mirror_cells}
+            for cell in expired_terminal:
+                del self.terminal_belts[cell]
+                if cell not in stripe_cells and cell not in self.drone_belt_cells:
+                    self.belts.pop(cell, None)
 
-        # 5. Record the frame so the visualizer shows every single step back-and-forth
-        game.record_frame()
-        
-    # 3. Game Over! Save the visualizer file securely in the project folder.
-    engine_dir = os.path.dirname(os.path.abspath(__file__))
-    replay_path = os.path.join(engine_dir, "match_final_replay.json")
-    
-    game.export_replay(replay_path)
-    print(f"Match Complete! Score: P1 {game.scores[1]} - P2 {game.scores[2]}")
-    print(f"Replay saved to: {replay_path}")
+        # 1-cell conveyor belt under each player's drone every 6 turns (reallocated, old ones disappear)
+        self.belt_drone_timer -= 1
+        if self.belt_drone_timer <= 0:
+            self.belt_drone_timer = BELT_DRONE_INTERVAL
+            stripe_cells = {c for s in self.belt_stripes for c in s.cells + s.mirror_cells}
+            for cell in self.drone_belt_cells:
+                if cell not in stripe_cells and cell not in self.terminal_belts:
+                    self.belts.pop(cell, None)
+            self.drone_belt_cells = []
 
-    # Terminate the background bot processes
-    for process in bot_processes.values():
-        process.terminate()
+            for p in (1, 2):
+                p_drones = [d for d in self.player_drones(p)
+                            if d.is_active and not self.is_mother_row(d.y)
+                            and self.terminal_at(d.x, d.y) is None]
+                if p_drones:
+                    chosen = self.rng.choice(p_drones)
+                    bdir = self.rng.choice((Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT))
+                    self.belts[(chosen.x, chosen.y)] = bdir
+                    self.drone_belt_cells.append((chosen.x, chosen.y))
 
-# This tells Python to run the engine and pass the executable commands for the bots
-if __name__ == "__main__":
-    import sys
-    import os
-    
-    python_exe = sys.executable
-    
-    # Get the exact folder where Game_Engine.py is located
-    engine_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Create the absolute path to Dummy_Bot.py
-    bot_path = os.path.join(engine_dir, "Dummy_Bot.py")
-    
-    # Pass the absolute path to the bots
-    play_match(
-        p1_cmd=[python_exe, "-u", bot_path],
-        p2_cmd=[python_exe, "-u", bot_path]
-    )
+    # -----------------------------------------------------------------------
+    # Map generation (everything is placed in mirrored pairs for fairness)
+    # -----------------------------------------------------------------------
+    def _generate_map(self):
+        for _ in range(200):
+            walls = set()
+            for _ in range(WALL_SEGMENT_PAIRS):
+                for cell in self._random_wall_segment():
+                    walls.add(cell)
+                    walls.add(mirror(*cell))
+            if self._is_connected(walls):
+                break
+        self.walls = walls
+        self._place_belt_stripes()
+        for i in range(TERMINAL_PAIRS):
+            self.terminals += [Terminal(2 * i, 0, 0, 0), Terminal(2 * i + 1, 0, 0, 0)]
+            self._relocate_terminal_pair(2 * i, announce=False)
+        for i in range(STORM_PAIRS):
+            self.storms += [AnimaStorm(0, 0, 0, 1, 0), AnimaStorm(0, 0, 0, 1, 0)]
+            self._respawn_storm_pair(2 * i, announce=False)
+
+    def _random_wall_segment(self) -> List[Tuple[int, int]]:
+        rng = self.rng
+        length = rng.randint(2, 6)
+        x0 = rng.randint(0, GRID_SIZE - 1)
+        y0 = rng.randint(5, GRID_SIZE // 2 - 1)
+        horizontal = rng.random() < 0.5
+        cells = [(x0 + i, y0) if horizontal else (x0, y0 + i) for i in range(length)]
+        if rng.random() < 0.3:                             # L-shaped corner piece
+            ex, ey = cells[-1]
+            arm = rng.randint(1, 3) * rng.choice((-1, 1))
+            step = 1 if arm > 0 else -1
+            cells += [(ex, ey + k) if horizontal else (ex + k, ey)
+                      for k in range(step, arm + step, step)]
+        return [(x, y) for (x, y) in cells if 0 <= x < GRID_SIZE and 4 <= y <= GRID_SIZE - 5
+                and not WALL_FREE_ROWS[0] <= y <= WALL_FREE_ROWS[1]]
+
+    @staticmethod
+    def _is_connected(walls: set) -> bool:
+        """All playable (non-wall, non-Mother-Node) cells must be reachable."""
+        open_cells = {(x, y) for y in range(1, GRID_SIZE - 1) for x in range(GRID_SIZE)} - walls
+        start = next(iter(open_cells))
+        seen = {start}
+        queue = deque([start])
+        while queue:
+            x, y = queue.popleft()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nxt = (x + dx, y + dy)
+                if nxt in open_cells and nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
+        return len(seen) == len(open_cells)
+
+    def _place_belt_stripes(self):
+        """Places 5 pairs (10 stripes); H and V counts differ by 1 pair (3H/2V or 2H/3V)."""
+        h_count = 3 if self.rng.random() < 0.5 else 2
+        v_count = BELT_STRIPE_PAIRS - h_count
+        orientations = ['H'] * h_count + ['V'] * v_count
+        self.rng.shuffle(orientations)
+        self.belt_stripes = []
+        for i in range(BELT_STRIPE_PAIRS):
+            stripe = BeltStripePair(i, orientations[i])
+            self.belt_stripes.append(stripe)
+            self._relocate_belt_stripe_pair(i, announce=False)
+
+    def _relocate_belt_stripe_pair(self, index: int, announce: bool = True):
+        """Relocates belt_stripes[index] to fresh symmetric non-overlapping cells in rows 10..39."""
+        stripe = self.belt_stripes[index]
+        # Remove old cells of this stripe
+        for cell in stripe.cells:
+            self.belts.pop(cell, None)
+        for cell in stripe.mirror_cells:
+            self.belts.pop(cell, None)
+        stripe.cells = []
+        stripe.mirror_cells = []
+
+        length = self.rng.randint(*BELT_STRIPE_LENGTH)
+        SECTORS = [
+            (1, 8, 10, 24),
+            (10, 18, 10, 24),
+            (20, 28, 10, 24),
+            (30, 38, 10, 24),
+            (40, 47, 10, 24),
+        ]
+        sx_min, sx_max, sy_min, sy_max = SECTORS[index % 5]
+        other_stripe_cells = {c for j, s in enumerate(self.belt_stripes) if j != index
+                              for c in s.cells + s.mirror_cells}
+        terminal_cells = {(t.x, t.y) for t in self.terminals}
+
+        chosen_cells, chosen_mcells, chosen_dir = None, None, None
+
+        for attempt in range(1000):
+            if stripe.orientation == 'H':
+                if attempt < 500:
+                    x0 = self.rng.randint(max(0, sx_min), min(GRID_SIZE - length, sx_max))
+                    y0 = self.rng.randint(sy_min, sy_max)
+                else:
+                    x0 = self.rng.randint(0, GRID_SIZE - length)
+                    y0 = self.rng.randint(10, 24)
+                cells = [(x0 + k, y0) for k in range(length)]
+                direction = self.rng.choice((Direction.LEFT, Direction.RIGHT))
+            else:
+                max_y0 = max(10, 24 - length + 1)
+                if attempt < 500:
+                    x0 = self.rng.randint(max(0, sx_min), min(GRID_SIZE - 1, sx_max))
+                    y0 = self.rng.randint(sy_min, min(sy_max, max_y0))
+                else:
+                    x0 = self.rng.randint(0, GRID_SIZE - 1)
+                    y0 = self.rng.randint(10, max_y0)
+                cells = [(x0, y0 + k) for k in range(length)]
+                direction = self.rng.choice((Direction.UP, Direction.DOWN))
+
+            mcells = [mirror(x, y) for (x, y) in cells]
+            all_cells = cells + mcells
+
+            if set(cells) & set(mcells):
+                continue
+            if any(c in self.walls or c in other_stripe_cells or c in terminal_cells
+                   or self.is_mother_row(c[1]) or not (10 <= c[1] <= 39)
+                   for c in all_cells):
+                continue
+
+            chosen_cells = cells
+            chosen_mcells = mcells
+            chosen_dir = direction
+            break
+
+        if chosen_cells:
+            stripe.cells = chosen_cells
+            stripe.mirror_cells = chosen_mcells
+            stripe.timer = self.rng.randint(*BELT_STRIPE_LIFESPAN)
+            mdir = chosen_dir.mirrored()
+            for c in chosen_cells:
+                self.belts[c] = chosen_dir
+            for c in chosen_mcells:
+                self.belts[c] = mdir
+            if announce:
+                self.events.append({"type": "belts_relocated", "pair": index})
+
+    def _relocate_terminal_pair(self, index: int, announce: bool = True):
+        """Relocates terminals[index:index+2] using the same sector and symmetry structure as anima storms."""
+        others = [t for j, t in enumerate(self.terminals) if j not in (index, index + 1) and (t.x, t.y) != (0, 0)]
+        pair_idx = (index // 2) % 3
+        # 3 sectors across columns (left, center, right); rows 11..23 so mirrors (26..38) avoid rows 0..9 and 40..49
+        SECTORS = [
+            (2, 14, 11, 23),    # Pair 0: left (mirror: right)
+            (18, 31, 11, 23),   # Pair 1: center (mirror: center)
+            (35, 47, 11, 23),   # Pair 2: right (mirror: left)
+        ]
+        sx_min, sx_max, sy_min, sy_max = SECTORS[pair_idx]
+
+        for attempt in range(1000):
+            if attempt < 500:
+                x = self.rng.randint(sx_min, sx_max)
+                y = self.rng.randint(sy_min, sy_max)
+            else:
+                x = self.rng.randint(1, GRID_SIZE - 2)
+                y = self.rng.randint(10, GRID_SIZE // 2 - 2)
+            mx, my = mirror(x, y)
+            if abs(x - mx) <= 1 and abs(y - my) <= 1:      # pair would overlap itself
+                continue
+            limit = 3 if attempt < 300 else 2
+            if any(abs(cx - t.x) <= limit and abs(cy - t.y) <= limit
+                   for t in others for cx, cy in ((x, y), (mx, my))):
+                continue
+            if any((cx, cy) in self.walls or (cx, cy) in self.belts
+                   or (cx, cy) in self.occupant
+                   for (cx, cy) in ((x, y), (mx, my))):
+                continue
+            break
+        life = self.rng.randint(*TERMINAL_LIFESPAN)
+        pair = self.terminals[index:index + 2]
+        for terminal, (tx, ty) in zip(pair, ((x, y), (mx, my))):
+            terminal.x, terminal.y, terminal.timer = tx, ty, life
+        if announce:
+            self.events.append({"type": "terminals_moved", "ids": [t.terminal_id for t in pair]})
+
+    def _respawn_storm_pair(self, index: int, announce: bool = True):
+        others = [s for j, s in enumerate(self.storms) if j not in (index, index + 1) and (s.x, s.y) != (0, 0)]
+        pair_idx = (index // 2) % 4
+        # Uniform distribution sectors across columns (extreme left, mid left, center, extreme right)
+        # and rows (center y in 11..23 so all storm cells remain strictly in rows 10..39, never 0..9 or 40..49).
+        SECTORS = [
+            (1, 10, 11, 17),    # Pair 0: extreme left (mirror: extreme right)
+            (13, 22, 14, 21),   # Pair 1: mid left (mirror: mid right)
+            (22, 27, 19, 23),   # Pair 2: center (mirror: center)
+            (39, 48, 11, 18),   # Pair 3: extreme right (mirror: extreme left)
+        ]
+        sx_min, sx_max, sy_min, sy_max = SECTORS[pair_idx]
+
+        for attempt in range(1000):
+            if attempt < 500:
+                x = self.rng.randint(sx_min, sx_max)
+                y = self.rng.randint(sy_min, sy_max)
+            else:
+                x = self.rng.randint(1, GRID_SIZE - 2)
+                y = self.rng.randint(STORM_ROWS[0] + 1, GRID_SIZE // 2 - 2)
+            mx, my = mirror(x, y)
+            if abs(x - mx) <= 2 and abs(y - my) <= 2:      # the pair would overlap itself
+                continue
+            limit = 3 if attempt < 300 else 2
+            if any(abs(cx - s.x) <= limit and abs(cy - s.y) <= limit
+                   for s in others for cx, cy in ((x, y), (mx, my))):
+                continue
+            if any((cx + dx, cy + dy) in self.walls
+                   for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                   for (cx, cy) in ((x, y), (mx, my))):
+                continue
+            break
+        life = self.rng.randint(*STORM_LIFESPAN)
+        multiplier = storm_multiplier(y)
+        for storm, (sx, sy) in zip(self.storms[index:index + 2], ((x, y), (mx, my))):
+            storm.storm_id = self.next_storm_id
+            self.next_storm_id += 1
+            storm.x, storm.y, storm.multiplier, storm.timer = sx, sy, multiplier, life
+        if announce:
+            self.events.append({"type": "storms_moved"})
+
+    def _spawn_starting_drones(self):
+        """STARTING_DRONES per player: P1 on row 1 at even columns, P2 the exact mirror on row 48."""
+        for i in range(min(STARTING_DRONES, DRONES_PER_PLAYER)):
+            self.add_drone(1, 2 * i, 1)
+            self.add_drone(2, *mirror(2 * i, 1))
+            self.reserve[1] -= 1
+            self.reserve[2] -= 1
+
+    # -----------------------------------------------------------------------
+    # Results & replays
+    # -----------------------------------------------------------------------
+    def result(self) -> dict:
+        """Winner by score, then surviving drones, then anchors; otherwise a draw."""
+        def key(p):
+            return (self.scores[p], len(self.player_drones(p)),
+                    sum(1 for a in self.anchors.values() if a.player_id == p))
+        k1, k2 = key(1), key(2)
+        winner = 1 if k1 > k2 else 2 if k2 > k1 else 0
+        return {
+            "winner": winner,
+            "scores": {"1": self.scores[1], "2": self.scores[2]},
+            "drones_left": {"1": k1[1], "2": k2[1]},
+            "anchors": {"1": k1[2], "2": k2[2]},
+            "stats": {"1": self.stats[1], "2": self.stats[2]},
+            "turns_played": self.turn,
+        }
+
+    def _frame(self) -> dict:
+        return {
+            "turn": self.turn,
+            "player": self.current_player if self.turn_started else 0,
+            "scores": [self.scores[1], self.scores[2]],
+            "reserve": [self.reserve[1], self.reserve[2]],
+            # [id, player, x, y, battery, powered, source_x, source_y]
+            "drones": [[d.drone_id, d.player_id, d.x, d.y, d.battery, int(d.is_powered),
+                        *(d.power_source or (-1, -1))]
+                       for d in sorted(self.drones.values(), key=lambda d: d.drone_id)],
+            "anchors": [[a.anchor_id, a.player_id, a.x, a.y, a.direction.name[0], a.hp]
+                        for a in self.anchors.values()],
+            "terminals": [[t.terminal_id, t.x, t.y, t.timer] for t in self.terminals],
+            "storms": [[s.storm_id, s.x, s.y, s.multiplier, s.timer] for s in self.storms],
+            "events": list(self.events),
+        }
+
+    def _belt_list(self) -> list:
+        return [[x, y, d.name[0]] for (x, y), d in sorted(self.belts.items())]
+
+    def record_frame(self):
+        """Compact snapshot of the board after a turn (frame 0 = starting position)."""
+        frame = self._frame()
+        belts = self._belt_list()
+        if belts != self._last_belts:                      # belts only stored when they change
+            frame["belts"] = belts
+            self._last_belts = belts
+        self.frames.append(frame)
+
+    def replay(self, meta: Optional[dict] = None) -> dict:
+        return {
+            "format": "tethered-grid-replay-v1",
+            "grid_size": GRID_SIZE,
+            "seed": self.seed,
+            "max_turns": self.max_turns,
+            "walls": [[x, y] for (x, y) in sorted(self.walls)],
+            "meta": meta or {},
+            "result": self.result(),
+            "frames": self.frames,
+        }
+
+    def snapshot(self) -> dict:
+        """Full current state (used by the in-browser sandbox)."""
+        frame = self._frame()
+        frame["belts"] = self._belt_list()
+        frame["walls"] = [[x, y] for (x, y) in sorted(self.walls)]
+        frame["player"] = self.current_player
+        frame["turn_started"] = self.turn_started
+        frame["acted"] = sorted(self.acted)
+        frame["can_act"] = sorted(self.can_act)
+        return frame
