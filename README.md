@@ -1,85 +1,110 @@
-# THE TETHERED GRID
+# The Tethered Grid
 
-**The Tethered Grid** is a multi-agent programming battle where players command a massive swarm of Drones. The objective is to secure moving scoring zones on a shifting grid.
+Read **The Tethered Grid v3** to get the idea of the game here[(https://docs.google.com/document/d/1XgGKd_IMZjwYMCiCfVOiwnnUdR7Z9xiQWOC6-nZncRo/edit?tab=t.hhq2rzkvn9u6#heading=h.tho8ke39w6sf)].
 
-There is no traditional health (HP) for units and no basic attacking on drones. Combat is entirely based on logistics, positioning, and sabotage. You defeat enemies by severing their power supply lines.
+## Quick start
 
-The game operates strictly on a **turn-based system**. This eliminates paradoxes like two bots trying to push each other simultaneously or conflicting movements. Turn-based doesn’t favour the player starting first or second, as this is a massive grid and the game depends on a lot of other things and strategies.
+### Files
 
-## 1. THE MAP & ENTITIES
+| File | What it is |
+|---|---|
+| `Game_Engine.py` | The rules. Pure Python, no I/O, deterministic for a given seed. All tunable numbers are at the top. |
+| `Match_Runner.py` | Runs two bot programs against each other: timeouts, crash handling, logs (`logs/`), replays (`replays/`). |
+| `Visualizer.html` | Replay viewer + live sandbox (runs the real engine in the browser via Pyodide). |
+| `bots/bot_template.py` | Start here when writing a bot. |
+| `bots/greedy_bot.py` | Baseline sparring bot: chains drones toward storms, crushes / evicts enemies. |
+| `bots/random_bot.py` | Random moves; useful for fuzzing. |
+| `bots/wip/spine_bot.py` | Work in progress: plans an explicit relay chain. Not better than greedy yet. |
+| `tests/` | Rule tests, a fuzz test (random garbage commands) and runner tests with crashing / hanging / slow bots. |
 
-The game takes place on a 50 x 50 grid. The map consists of the following elements:
+Needs Python 3.8+ and nothing else (on Linux / macOS type `python3` where this says `python`).
 
-- **Normal Walls (#):** Impassable and immovable static blocks. Line of Sight cannot pass through them.
-- **Conveyor Belts (~):** Moving floor tiles. At the end of the turn, they force any drone standing on them (except Anchors) to move 1 cell in a specific direction.
-- **Terminals (T):** Hackable control panels that grant map manipulation. Terminals are volatile; they have a lifespan of some turns (adjustable) to prevent permanent camping. Once the timer reaches zero, the Terminal teleports to a new random location.
-- **Anima Storms ($):** 3x3 scoring zones that occur randomly across the map.
-- **Mother-Node (M):** The Mother-Nodes consist of **two full extreme rows** at opposite ends of the board (one row per player). These act as the permanent, unmovable primary power sources.
-- **Drones (D):** Your controllable units. To support massive swarm tactics, players will get **25 reserved Drones** (adjustable). (Note: There is no respawning. Once a drone dies, it is permanently removed).
-- **Anchors (A):** Permanent, independent power relays created by sacrificing 3 Drones. It can be destroyed by sabotage_anchor by 3 enemy drones ( see below ).
+```bash
+# Play a match between two bots (≈10 s) and save a replay
+python Match_Runner.py bots/greedy_bot.py bots/random_bot.py --seed 7
 
-**Fog of War:** Bots do not receive the entire map state. Your bot will only receive data for a 5x5 grid centered on each of your active units. You must constantly move your swarm to scout for Storms, Terminals, and enemies.
+# Same seed, played twice with sides swapped (use this for real comparisons)
+python Match_Runner.py bots/greedy_bot.py bots/random_bot.py --seed 7 --both-sides
 
-## 2. POWER SYSTEM & BATTERIES
+# Run the rule tests
+python -m unittest discover -s tests
+```
 
-Drones do not have unlimited internal power. They can only execute commands and know about their surroundings if they are **Active**.
+Watch a replay: open `Visualizer.html` in a browser and click **Open replay**
+(or drag a file from `replays/` onto the board).
 
-- **Line of Sight (LoS):** To receive direct power, a Drone must have an unobstructed straight line of sight (horizontal, vertical, or diagonal) back to the Mother-Node row OR to another **powered** friendly unit in the chain OR friendly Anchor.
-- **Range Limit:** The maximum distance for a valid LoS power connection is **5 cells**.
-- **Obstructions:** LoS is blocked by Normal Walls (#) and Enemy units and inert units of enemy as well.
+To play with the live engine (the **Sandbox** tab: manual play, you vs bot), run
 
-**The Battery Mechanic & Inert State:**
+```bash
+python start_visualizer.py
+```
 
-- Every Drone possesses an internal battery with a **5-turn capacity (adjustable)**.
-- If a Drone's LoS to the power chain is broken, it doesn't die immediately. It runs on its battery, allowing it to act normally for up to 5 turns.
-- **Power Down:** Once the battery reaches 0, the Drone becomes an **Inert Obstacle (X)**. Inert drones cannot execute commands or move. However, they remain on the grid and act as physical obstructions that may block enemy LoS!
-- **Recharging:** An inert Drone can be revived! If a friendly, fully-connected network extends its LoS back to the inert drone, it immediately regains connectivity. Its battery will then charge at a rate of **+1 per turn**, capped at 5 (adjustable).
+It opens the visualizer in your browser through a small local server (opening the HTML
+file directly does not work for the sandbox: browsers block it from loading `Game_Engine.py`).
+Doing the same by hand:
 
-### 3. TURN ACTIONS
+```bash
+python -m http.server 8000
+# then open http://localhost:8000/Visualizer.html?sandbox=1
+# or       http://localhost:8000/Visualizer.html?replay=replays/seed7.json
+```
 
-Every turn, your bot must return an array of commands for its active Drones. You can issue exactly **one** command per active Drone per turn.
+In the sandbox you can play either side by hand. To play **you vs the bot**, tick **Bot is P2**:
+the greedy bot then answers every P2 turn automatically (or press **Bot plays turn** to let it move
+for whichever side is up). Click an empty cell to SPAWN; the **Drone P1 / P2** tools place drones
+anywhere for quick debugging. You can also step the greedy bot, edit the board
+(walls, belts, drones, anchors, storms, terminals, drain batteries), undo/redo, and
+see the exact JSON payload a bot would receive.
 
-| **Action**   | **Command**     | **Parameters** | **Description**                                                    | **Movement / Interaction Rules**                                                                                                                                                                                                                       |
-| ------------ | --------------- | -------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Move**     | MOVE            | [Direction]    | Moves the Drone 1 cell orthogonally (Up, Down, Left, Right).       | Cannot move into cells containing walls, enemy Anchors or other Drones (friendly, enemy, or inert).                                                                                                                                                    |
-| **Push**     | PUSH            | [Direction]    | Forces an adjacent entity 1 cell in the specified direction.       | Used for tactical positioning, breaking line-of-sight, or crushing enemy Drones against solid walls.                                                                                                                                                   |
-| **Interact** | INTERACT        | [Type, Target tile, Direction]           | Hacks the underlying Terminal to manipulate map mechanics.         | The Drone must occupy the Terminal tile. Grants absolute control over any single **visible** grid tile for that turn (add for 2 turns, remove, or rotate existing conveyor belts). Targeting Mother-Nodes, Walls, or Enemy Anchors doesn’t make sense. |
-| **Build**    | BUILD           | [Direction]           | Consumes 3 friendly Drones to construct a permanent Anchor.        | Requires 3 active friendly Drones on the same line to simultaneously issue BUILD. Placed directly on the central Drone's cell.                                                                                                                         |
-| **Sabotage** | SABOTAGE_ANCHOR | [Target Anchor]           | Sacrifices the Drone to deal 1 point of damage to an enemy Anchor. | The Drone must be within the enemy Anchor's 5 x 5 defense region (centered on the Anchor). Permanently destroys the executing Drone.                                                                                                                      |
-| **Wait**     | WAIT            | None           | Holds position and takes no action for the turn.                   | Useful for maintaining static tether nodes or holding scoring positions in an Anima Storm.                                                                                                                                                              |
-| **Spawn**    | SPAWN           | [Target Cell]           | Spawns our drone at the cell we want, capped at 25.                | For spawning a drone, there must be at least 1 reserved drones( drones which weren’t spawned yet).<br>Also the spawned drone should get power supply immediately, otherwise it won’t spawn.                                                            |
+## **1. Start the visualizer**
 
-**Note:** Reserved drones = 25 - Drones which already spawned (active and inert) - Drones that died/removed.
+1. Save all the files in one folder.
+2. Open a command prompt in the repository root (the folder that contains `start_visualizer.py`).
+3. Run `start_visualizer.py`
 
-## 4. COMBAT & ELIMINATION
+   - This starts a tiny local HTTP server and automatically opens your default browser pointing at `Visualizer.html`.
 
-Because there is no standard HP for units, you eliminate enemies through positional sabotage and battery starvation. **Once a drone is destroyed, it is gone forever, no respawning.**
+## **2. Basic UI controls (manual)**
 
-- **The Body-Block:** Simply moving your Drone between two enemy Drones breaks their Line of Sight.
-- **The Push:** Pushing an enemy out of their 5-cell range may unplug them from power network.
-- **Environmental Sabotage:** You cannot hack an enemy Drone directly, but you can hack the floor beneath them! Using INTERACT on a Terminal lets you manipulate a conveyor belt under an enemy squad. The floor will drag their network behind a wall, severing their connection simultaneously. This may even push an enemy drone into a wall and destroy it.
-- **Permanent Destruction:** If you use PUSH to force an enemy Drone into a solid wall, the Drone is permanently crushed and removed from the game completely.
+**Note:** The **Tool Box** in the left side is strictly for **debugging purposes / editing the grid entities**. Selecting "command" and then the below information to make your moves is actually how the game abide by rules, select any other option of tool box and using it tells how the engine works for special cases. For example, according to rules, we cannot spawn a drone at any point that we want on the grid, but using tool box we can put 2 drones adjacent to a wall and then commanding the drone to push the other against a wall to see if it disappears or not for testing edge cases. If we tried to test this edge case by following the rules then that might take proper network of drones to reach the wall and the perfect position where one drone can push the other. So tool box does this quick.
 
-## 5. ANCHORS
+| Control | What it does |
+|---|---|
+| **Spawn Drone** | Click an empty grid cell to spawn a drone there (ensure that some other drone's "INTERACT", "BUILD", etc. isn't in effect). You may spawn a maximum of 5 drones in a single turn. Pressing "End Turn" confirms the actions for all your drones for this turn and passes the turn to the opponent. Spawning a drone is itself an action, so you cannot perform actions like "move", "push", etc. for the spawned drone for this turn.|
+| **Select Drone** | Click on a drone to select / highlight it; its stats appear in the right-hand panel. Clicking again de-selects it. |
+| **MOVE / WAIT** | Click on the drone to select it, then in "selected drone" box choose any direction to move it in that direction if possible according to rules or choose **WAIT** to do nothing for that drone. |
+| **PUSH** | Click on the drone to select it, then in "selected drone" box choose "push up", "push down", etc. This pushes an adjacent entity (in the same direction choosen), if there, by 1 unit in the direction choosen. |
+| **Interact** | After selecting a drone, click **Interact** and then click a valid cell to hack it. "Select belt direction..." appears if you click an empty visible cell and then choosing direction places a belt with specified direction there. "Existing belt..." appears if you click on a visible existing belt, you may then choose to change its direction or remove it instead.|
+| **Build** | Select a drone, click **Build**, choose the desired direction for power beam of the anchor, then click the two drones beside it that lie on the same line to build anchor on the central drone. Ensure that the build operation is commanded through central drone. |
+| **Sabotage** | Select a drone, click **Sabotage**, then click any valid enemy anchor to lower its hp by 1, if it becomes 0, anchor disappears (our drone is removed in this process according to rules).  |
+| **End Turn** | Commits all actions that we performed for our drones one by one previously, updates battery life, scores, performs the job of conveyor belts and advances the world tick and passes the turn to the opponent if turns are still remaining. |
+| **Bot Turn** | Press **Bot Turn** to let the built-in greedy bot play the current turn automatically. |
+| **Bot is P2** | Greedy bot now controls all actions of player 2 and we don't need to control player 2 actions manually.  |
+| **Undo / Redo** | Self-explanatory. |
 
-Conveyor belts will constantly threaten to move your Drones out of alignment and snap your tethers. To lock down an area, you can build an **Anchor**.
 
-- **How to Build:** 3 active Drones must be on the same line. All 3 must issue the BUILD command. They are permanently removed from your Drone count, and 1 Anchor is placed. (This is an irreversible operation).
-- **Independent Power Source:** Unlike Drones, Anchors do not need to be tethered to the Mother-Node. They are completely independent power sources.
-- **Directional Beam:** An Anchor does not provide 360-degree power. It provides power along **one specific orthogonal direction**, projecting a beam for a maximum distance of 5 cells.
-- **Immunity:** Anchors are completely immune to Conveyor Belts and cannot be pushed.
-- **Destruction:** Anchors are tough, but not invincible. They have **3 HP**. To destroy one, an enemy must send their own Drones into the Anchor's 5x5 defense region. The enemy must use the SABOTAGE_ANCHOR command, permanently sacrificing their own Drone to deal 1 damage to the Anchor.
+## **3. Typical workflow to spawn a drone**
 
-## 6. SCORING & VICTORY
+1. **Select** an empty square where you want the drone.
+2. Click the **Spawn Drone** button (or simply click the square – the UI treats a click on an empty cell as a spawn request).
+3. Press **End Turn** – the engine will deduct battery if the drone is not on a powered tile and will update the score.
 
-The game lasts for a fixed number of turns (e.g., 3000). The winner is determined by total score. If both have the same scores then we may look at other factors like anchors, drone count, battery, etc.
+## **4. Using other actions**
 
-Points are awarded dynamically based on the **Anima Storms**. For every turn, you gain points equal to:
+- **Conveyor belts**: After clicking **Interact**, a small panel appears. Choose **North / East / South / West** to set the belt direction.
+- **Removing a belt**: Click the belt cell, choose **Interact**, then pick **Remove** in the direction panel.
+- **Terminals / Anchors**: Follow the same pattern – the UI will prompt for the required direction.
 
-[Number of your active Drones inside the Storm] × [Storm's Current Multiplier]
+## **5. Running a full match from the command line (optional)**
 
-(Note: Inert Drones that have 0 battery inside a Storm award 0 points. Drones must be **Active** to score points!)
+If you want to run a whole game without the UI, use the helper script:
 
-## Note:
+```bash
+python Match_Runner.py --bot bots/greedy_bot.py --seed 42
+```
 
-1. If 2 Conveyor belt tiles try to push drones on them onto the same square, their actions get nullified.
+This script loads `Game_Engine.py` and the specified bot, runs the match to completion, prints the final score, and writes a replay JSON.
+
+---
+
+**That’s it!** You now have the minimal steps to launch the visualizer, control drones, and optionally run a match from the console.
